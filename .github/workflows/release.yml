@@ -1,0 +1,75 @@
+name: Build & Release (aarch64-linux-gnu)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build aarch64-unknown-linux-gnu
+    runs-on: ubuntu-22.04-arm
+    env:
+      CARGO_TERM_COLOR: always
+      BIN_NAME: rust-http-proxy
+      TARGET: aarch64-unknown-linux-gnu
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Cache cargo registry & target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ env.TARGET }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ env.TARGET }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ env.TARGET }}
+
+      - name: Verify glibc compatibility
+        run: |
+          file target/${{ env.TARGET }}/release/${{ env.BIN_NAME }}
+          echo "--- Required GLIBC versions ---"
+          objdump -T target/${{ env.TARGET }}/release/${{ env.BIN_NAME }} \
+            | grep -oE 'GLIBC_[0-9.]+' | sort -u || true
+
+      - name: Package artifact
+        id: pkg
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          PKG_NAME="${{ env.BIN_NAME }}-${VERSION}-${{ env.TARGET }}.tar.gz"
+          mkdir -p dist
+          cp target/${{ env.TARGET }}/release/${{ env.BIN_NAME }} dist/
+          tar -czf "${PKG_NAME}" -C dist ${{ env.BIN_NAME }}
+          sha256sum "${PKG_NAME}" > "${PKG_NAME}.sha256"
+          echo "pkg_name=${PKG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.pkg_name }}
+          path: |
+            ${{ steps.pkg.outputs.pkg_name }}
+            ${{ steps.pkg.outputs.pkg_name }}.sha256
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ steps.pkg.outputs.pkg_name }}
+            ${{ steps.pkg.outputs.pkg_name }}.sha256
+          generate_release_notes: true

@@ -1,0 +1,7 @@
+{
+  "tool_name": "Bash",
+  "tool_input_preview": "{\"command\":\"pkill -f rust-http-proxy 2>/dev/null\\nsleep 0.6\\nRUST_LOG=info ./target/release/rust-http-proxy >/tmp/proxy.log 2>&1 &\\necho $! > /tmp/proxy.pid\\nsleep 0.8\\n\\necho \\\"--- HTTPS CONNECT ---\\...",
+  "error": "Exit code 144",
+  "timestamp": "2026-06-30T11:23:11.665Z",
+  "retry_count": 1
+}
