@@ -1,0 +1,73 @@
+[Unit]
+# 单元描述与依赖。
+Description=Rust HTTP Proxy (high-performance forward proxy with metrics)
+Documentation=https://github.com/your-org/rust-http-proxy
+# 等待网络栈就绪后再启动；nss-lookup 保证 DNS 可用。
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+# 重启限流：60s 内最多重启 5 次，超过则放弃以避免雪崩。
+# 这两项历史上需要放在 [Unit] 段；放 [Service] 会被忽略。
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# ── 运行身份 ───────────────────────────────────────────────────────────────
+# 专用系统用户/用户组，最小权限运行。
+# 安装时需要先创建（见 deploy/install.sh 或 README）。
+User=rust-proxy
+Group=rust-proxy
+
+# ── 工作目录与启动命令 ────────────────────────────────────────────────────
+# 代理启动时会读取 ${WorkingDirectory}/config.toml。
+WorkingDirectory=/opt/rust-http-proxy
+ExecStart=/opt/rust-http-proxy/rust-http-proxy
+
+# ── 日志：走 systemd-journald ─────────────────────────────────────────────
+# RUST_LOG 控制 tracing 级别；info 满足大多数场景。
+Environment=RUST_LOG=info
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rust-http-proxy
+
+# ── 重启策略 ──────────────────────────────────────────────────────────────
+# 异常退出立即重启；限流参数在 [Unit] 段里。
+Restart=on-failure
+RestartSec=2s
+
+# ── 文件描述符 / 进程数上限 ───────────────────────────────────────────────
+# 代理是高并发服务，提升 fd 上限避免 EMFILE。
+LimitNOFILE=1048576
+LimitNPROC=65536
+
+# ── 优雅退出 ──────────────────────────────────────────────────────────────
+# 代理在主循环里监听 SIGINT/SIGTERM，给 10s 完成在途请求与日志 flush。
+KillSignal=SIGTERM
+TimeoutStopSec=10s
+
+# ── 安全加固（systemd sandbox） ───────────────────────────────────────────
+# 这些设定基本零代价，但能显著缩小被攻陷后的影响面。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# 只允许 IPv4/IPv6 + AF_UNIX；屏蔽其他协议族减少内核攻击面。
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 屏蔽访问 /sys/fs/cgroup 之类的旁路。
+ProtectClock=true
+ProtectHostname=true
+# 仅放行常见 syscall 集合（@system-service 涵盖网络服务必需的几乎全部 syscall）。
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# 允许写入的目录（其余文件系统在 ProtectSystem=strict 下只读）。
+# 留空则没有可写目录；代理本身无需写盘。如果将来要写日志/数据，把目录加到这里。
+# ReadWritePaths=/var/log/rust-http-proxy
+
+[Install]
+WantedBy=multi-user.target

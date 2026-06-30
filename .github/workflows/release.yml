@@ -50,13 +50,31 @@ jobs:
       - name: Package artifact
         id: pkg
         run: |
+          set -euxo pipefail
           VERSION="${GITHUB_REF_NAME}"
           PKG_NAME="${{ env.BIN_NAME }}-${VERSION}-${{ env.TARGET }}.tar.gz"
-          mkdir -p dist
-          cp target/${{ env.TARGET }}/release/${{ env.BIN_NAME }} dist/
-          tar -czf "${PKG_NAME}" -C dist ${{ env.BIN_NAME }}
+          # 解压后用户会得到一个清晰的子目录，避免污染当前路径。
+          STAGE="${{ env.BIN_NAME }}-${VERSION}"
+
+          mkdir -p "dist/${STAGE}/deploy"
+
+          # 必备：二进制 + 默认配置 + 部署脚本/unit
+          cp "target/${{ env.TARGET }}/release/${{ env.BIN_NAME }}" "dist/${STAGE}/"
+          cp config.toml                                            "dist/${STAGE}/"
+          cp deploy/rust-http-proxy.service                         "dist/${STAGE}/deploy/"
+          cp deploy/install.sh                                      "dist/${STAGE}/deploy/"
+          chmod +x "dist/${STAGE}/deploy/install.sh"
+
+          # 文档：有就带，没有也不致命
+          [ -f README.md ] && cp README.md "dist/${STAGE}/" || true
+          [ -d docs ]      && cp -r docs   "dist/${STAGE}/" || true
+
+          tar -czf "${PKG_NAME}" -C dist "${STAGE}"
           sha256sum "${PKG_NAME}" > "${PKG_NAME}.sha256"
           echo "pkg_name=${PKG_NAME}" >> $GITHUB_OUTPUT
+
+          echo "--- tarball contents ---"
+          tar -tzf "${PKG_NAME}" | head -50
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
