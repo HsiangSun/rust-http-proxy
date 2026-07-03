@@ -64,7 +64,18 @@ sudo bash deploy/install.sh
 1. 创建系统用户 `rust-proxy`（最小权限运行）
 2. 将二进制 + `config.toml` 拷贝到 `/opt/rust-http-proxy/`
 3. 安装 `rust-http-proxy.service` 到 `/etc/systemd/system/`
-4. `systemctl enable + restart`，并打印状态
+4. 安装 `deploy/sysctl.d/99-rust-http-proxy.conf` 到 `/etc/sysctl.d/` 并 `sysctl --system` 生效
+   （放开 `somaxconn` / `ip_local_port_range` / TCP 缓冲区 / BBR / TIME\_WAIT 复用 等，
+   与 unit 里的 `LimitNOFILE=1048576` 配套；不需要时用 `SKIP_SYSCTL=1 sudo ./install.sh` 跳过）
+5. `systemctl enable + restart`，并打印状态
+
+内核调优效果自检：
+
+```bash
+sysctl net.core.somaxconn net.ipv4.ip_local_port_range net.ipv4.tcp_congestion_control
+cat /proc/$(pidof rust-http-proxy)/limits | grep -E "open files|processes"
+# 期望：somaxconn=65535；port_range=1024 65535；congestion_control=bbr；open files=1048576
+```
 
 常用操作：
 
@@ -81,3 +92,5 @@ sudo systemctl stop rust-http-proxy
 
 - [设计与实现规范](docs/DESIGN.md)
 - [指标手册](docs/METRICS.md)
+- [可观测：VictoriaMetrics 抓取 + Grafana Dashboard](docs/OBSERVABILITY.md)
+- [Grafana Dashboard JSON](docs/grafana-dashboard.json)

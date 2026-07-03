@@ -129,6 +129,10 @@ pub struct OpenObserveConfig {
     pub flush_interval_ms: u64,
     /// 内部 channel 容量；满后将丢弃最旧日志。
     pub channel_capacity: usize,
+    /// 业务分组标签，会注入每条日志的顶层字段 `proxy_group`，
+    /// 与 VictoriaMetrics 抓取里同名的 label 对齐，方便跨可观测组件做联动查询。
+    #[serde(default)]
+    pub proxy_group: String,
 }
 
 impl Default for OpenObserveConfig {
@@ -143,6 +147,7 @@ impl Default for OpenObserveConfig {
             batch_size: 200,
             flush_interval_ms: 1000,
             channel_capacity: 10_000,
+            proxy_group: String::new(),
         }
     }
 }
@@ -190,6 +195,9 @@ impl Config {
         }
         if let Ok(v) = std::env::var("OO_ENABLED") {
             self.openobserve.enabled = matches!(v.as_str(), "1" | "true" | "TRUE" | "yes");
+        }
+        if let Ok(v) = std::env::var("OO_PROXY_GROUP") {
+            self.openobserve.proxy_group = v;
         }
     }
 }

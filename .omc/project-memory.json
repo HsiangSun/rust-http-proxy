@@ -1,0 +1,140 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1783097699316,
+  "projectRoot": "/home/sean/code/rustCode/rust-http-proxy",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Rust",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "Cargo.toml"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "cargo",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": "cargo build",
+    "testCommand": "cargo test",
+    "lintCommand": "cargo clippy",
+    "devCommand": "cargo run",
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "src"
+    ],
+    "gitBranches": null
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "deploy": {
+      "path": "deploy",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1783097699311,
+      "keyFiles": [
+        "install.sh",
+        "rust-http-proxy.service"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 4,
+      "lastAccessed": 1783097699313,
+      "keyFiles": [
+        "DESIGN.md",
+        "METRICS.md",
+        "OBSERVABILITY.md",
+        "grafana-dashboard.json"
+      ]
+    },
+    "src": {
+      "path": "src",
+      "purpose": "Source code",
+      "fileCount": 8,
+      "lastAccessed": 1783097699314,
+      "keyFiles": [
+        "config.rs",
+        "dns.rs",
+        "listener.rs",
+        "logger.rs",
+        "main.rs"
+      ]
+    },
+    "target": {
+      "path": "target",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1783097699314,
+      "keyFiles": [
+        "CACHEDIR.TAG"
+      ]
+    }
+  },
+  "hotPaths": [
+    {
+      "path": "docs/grafana-dashboard.json",
+      "accessCount": 7,
+      "lastAccessed": 1783099999466,
+      "type": "file"
+    },
+    {
+      "path": "src/proxy.rs",
+      "accessCount": 4,
+      "lastAccessed": 1783099519722,
+      "type": "file"
+    },
+    {
+      "path": "deploy/install.sh",
+      "accessCount": 3,
+      "lastAccessed": 1783098830383,
+      "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 3,
+      "lastAccessed": 1783098830530,
+      "type": "file"
+    },
+    {
+      "path": "src/config.rs",
+      "accessCount": 1,
+      "lastAccessed": 1782911714386,
+      "type": "file"
+    },
+    {
+      "path": "config.toml",
+      "accessCount": 1,
+      "lastAccessed": 1782911714396,
+      "type": "file"
+    },
+    {
+      "path": "deploy/rust-http-proxy.service",
+      "accessCount": 1,
+      "lastAccessed": 1783098703605,
+      "type": "file"
+    },
+    {
+      "path": "deploy/sysctl.d/99-rust-http-proxy.conf",
+      "accessCount": 1,
+      "lastAccessed": 1783098830101,
+      "type": "file"
+    }
+  ],
+  "userDirectives": []
+}

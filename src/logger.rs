@@ -125,6 +125,10 @@ async fn run_forwarder(cfg: OpenObserveConfig, mut rx: mpsc::Receiver<LogEntry>)
     );
     let auth_header = build_basic_auth_header(&cfg.username, &cfg.password);
 
+    // 把上报时需要附加的固定字段提前算出来，flush 时直接用。
+    // 当前只有 proxy_group 一项；后续若有 region/env 也加进来。
+    let proxy_group = cfg.proxy_group.clone();
+
     let mut buf: Vec<LogEntry> = Vec::with_capacity(cfg.batch_size);
     let mut ticker = interval(Duration::from_millis(cfg.flush_interval_ms));
     // 默认 tick 行为是 Burst，避免 task 启动时立刻 flush 空 buffer。
@@ -140,12 +144,12 @@ async fn run_forwarder(cfg: OpenObserveConfig, mut rx: mpsc::Receiver<LogEntry>)
                     Some(item) => {
                         buf.push(item);
                         if buf.len() >= cfg.batch_size {
-                            flush(&client, &url, auth_header.as_deref(), &mut buf).await;
+                            flush(&client, &url, auth_header.as_deref(), &proxy_group, &mut buf).await;
                         }
                     }
                     None => {
                         // sender 全部释放，flush 残留后退出。
-                        flush(&client, &url, auth_header.as_deref(), &mut buf).await;
+                        flush(&client, &url, auth_header.as_deref(), &proxy_group, &mut buf).await;
                         break;
                     }
                 }
@@ -153,7 +157,7 @@ async fn run_forwarder(cfg: OpenObserveConfig, mut rx: mpsc::Receiver<LogEntry>)
 
             _ = ticker.tick() => {
                 if !buf.is_empty() {
-                    flush(&client, &url, auth_header.as_deref(), &mut buf).await;
+                    flush(&client, &url, auth_header.as_deref(), &proxy_group, &mut buf).await;
                 }
             }
         }
@@ -161,17 +165,33 @@ async fn run_forwarder(cfg: OpenObserveConfig, mut rx: mpsc::Receiver<LogEntry>)
 }
 
 /// 将 buffer 内全部条目一次性 POST 到 OpenObserve。
+///
+/// `proxy_group` 非空时，会被注入到每条日志的 `fields` 里作为顶层字段，
+/// 与 VictoriaMetrics 抓取的同名 label 对齐，便于跨日志/指标过滤。
 async fn flush(
     client: &reqwest::Client,
     url: &str,
     auth_header: Option<&str>,
+    proxy_group: &str,
     buf: &mut Vec<LogEntry>,
 ) {
     if buf.is_empty() {
         return;
     }
     // swap 出 buffer，让 channel 在网络 IO 阶段继续接收新条目。
-    let payload = std::mem::take(buf);
+    let mut payload = std::mem::take(buf);
+
+    // 给每条日志注入 proxy_group（仅在配置了非空值时）。
+    if !proxy_group.is_empty() {
+        for entry in payload.iter_mut() {
+            if let Value::Object(map) = &mut entry.fields {
+                map.insert(
+                    "proxy_group".to_string(),
+                    Value::String(proxy_group.to_string()),
+                );
+            }
+        }
+    }
 
     let mut req = client.post(url).json(&payload);
     if let Some(h) = auth_header {

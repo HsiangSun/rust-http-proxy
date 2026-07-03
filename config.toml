@@ -42,7 +42,9 @@ connect_timeout_secs = 10
 [openobserve]
 # 是否启用日志上报。
 enabled = false
-# OpenObserve 入口，例如 https://api.openobserve.ai
+# OpenObserve 入口。
+#   * 本地调试：http://127.0.0.1:5080
+#   * EKS 内 NLB 暴露：http://<internal-nlb-dns>:5080
 endpoint = "http://127.0.0.1:5080"
 organization = "default"
 stream = "proxy_logs"
@@ -54,3 +56,7 @@ batch_size = 200
 flush_interval_ms = 1000
 # 通道缓冲，超出后将丢弃最旧日志以保护代理主路径。
 channel_capacity = 10_000
+# 业务分组标签，每条日志会自动注入顶层字段 proxy_group=<该值>。
+# 多组代理共享同一 stream 时用它在 OpenObserve UI 里过滤；
+# 与 VictoriaMetrics 抓取里的 proxy_group label 保持一致即可。
+proxy_group = ""

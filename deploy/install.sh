@@ -22,6 +22,9 @@ APP_DIR="/opt/rust-http-proxy"
 UNIT_NAME="rust-http-proxy.service"
 UNIT_SRC="${SCRIPT_DIR}/${UNIT_NAME}"
 UNIT_DST="/etc/systemd/system/${UNIT_NAME}"
+SYSCTL_NAME="99-rust-http-proxy.conf"
+SYSCTL_SRC="${SCRIPT_DIR}/sysctl.d/${SYSCTL_NAME}"
+SYSCTL_DST="/etc/sysctl.d/${SYSCTL_NAME}"
 
 # 二进制查找顺序：环境变量 BIN > 脚本同级 > 上级目录
 BIN_DEFAULT_CANDIDATES=(
@@ -117,6 +120,19 @@ if [[ ! -f "$UNIT_SRC" ]]; then
 fi
 install -m 0644 "$UNIT_SRC" "$UNIT_DST"
 echo "[+] systemd unit 安装到 $UNIT_DST"
+
+# ── 3.5 安装内核调优 sysctl（可用 SKIP_SYSCTL=1 跳过） ────────────────────
+# 高并发代理必备：放开 fd、backlog、TIME_WAIT、临时端口、BBR 等。
+# 与 unit 的 LimitNOFILE 配套；不装的话进程会被内核上限倒挂。
+if [[ "${SKIP_SYSCTL:-0}" != "1" && -f "$SYSCTL_SRC" ]]; then
+  install -m 0644 "$SYSCTL_SRC" "$SYSCTL_DST"
+  echo "[+] 内核调优参数安装到 $SYSCTL_DST"
+  # 立即生效；conntrack 缺模块时 sysctl 会打印警告，忽略即可。
+  sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_DST" >/dev/null 2>&1 || true
+  echo "[+] sysctl 已应用（校验：sysctl net.core.somaxconn net.ipv4.tcp_congestion_control）"
+elif [[ "${SKIP_SYSCTL:-0}" == "1" ]]; then
+  echo "[i] SKIP_SYSCTL=1，跳过内核调优安装"
+fi
 
 # ── 4. 启动服务 ───────────────────────────────────────────────────────────
 systemctl daemon-reload

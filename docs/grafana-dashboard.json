@@ -1,0 +1,421 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "总览",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "id": 100,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "QPS (1m)",
+      "id": 1,
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum(rate(proxy_requests_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m]))",
+          "refId": "A"
+        }
+      ],
+      "options": { "colorMode": "value", "graphMode": "area", "textMode": "auto" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 1 } }
+    },
+    {
+      "type": "stat",
+      "title": "成功率 (5m)",
+      "id": 2,
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "(sum(rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)) / clamp_min((sum(rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)) + (sum(rate(proxy_requests_failure_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)), 0.0001)",
+          "refId": "A"
+        }
+      ],
+      "options": { "colorMode": "background", "graphMode": "area" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "orange", "value": 0.95 },
+              { "color": "green", "value": 0.99 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "活跃连接",
+      "id": 3,
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum(proxy_active_connections{proxy_group=~\"$proxy_group\", instance=~\"$instance\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "type": "stat",
+      "title": "HTTPS 隧道总数",
+      "id": 4,
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum(proxy_https_tunnels_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"})",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+
+    {
+      "type": "row",
+      "title": "流量与错误",
+      "id": 101,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "QPS by status",
+      "id": 5,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum by (protocol) (rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "success/{{protocol}}",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (rate(proxy_requests_failure_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "fail/{{reason}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "fillOpacity": 10, "stacking": { "mode": "normal" } } }
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "lastNotNull", "max"] } }
+    },
+    {
+      "type": "timeseries",
+      "title": "上下行字节速率",
+      "id": 6,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum(rate(proxy_bytes_up_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "up (client→upstream)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(proxy_bytes_down_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m]))",
+          "legendFormat": "down (upstream→client)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } }
+    },
+
+    {
+      "type": "row",
+      "title": "延迟",
+      "id": 102,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 14 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "全局延迟分位 (P50/P95/P99)",
+      "id": 7,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_request_duration_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 5 } } }
+    },
+    {
+      "type": "timeseries",
+      "title": "按 host 的 P99 延迟",
+      "id": 8,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (host, le) (rate(proxy_request_duration_by_host_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\", host=~\"$host\"}[5m])))",
+          "legendFormat": "{{host}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 0 } } },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "lastNotNull"] } }
+    },
+
+    {
+      "type": "row",
+      "title": "DNS / 上游建连",
+      "id": 103,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 23 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "DNS 缓存命中率",
+      "id": 9,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum(rate(proxy_dns_cache_hits_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m])) / clamp_min(sum(rate(proxy_dns_cache_hits_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m])) + sum(rate(proxy_dns_cache_misses_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[1m])), 0.0001)",
+          "legendFormat": "hit ratio",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } }
+    },
+    {
+      "type": "timeseries",
+      "title": "上游建连耗时 (P50/P95/P99)",
+      "id": 10,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(proxy_upstream_connect_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(proxy_upstream_connect_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(proxy_upstream_connect_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+
+    {
+      "type": "row",
+      "title": "进程资源",
+      "id": 104,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "CPU 使用率 (per instance)",
+      "id": 11,
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "process_cpu_percent{proxy_group=~\"$proxy_group\", instance=~\"$instance\"} / 100",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "常驻内存 (per instance)",
+      "id": 12,
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "process_memory_bytes{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "bytes" } }
+    },
+
+    {
+      "type": "row",
+      "title": "按 host 明细",
+      "id": 105,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 41 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "title": "Top hosts by QPS + P99 + 错误率",
+      "id": 13,
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 42 },
+      "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+      "targets": [
+        {
+          "expr": "sum by (host) (rate(proxy_request_duration_by_host_seconds_count{proxy_group=~\"$proxy_group\", instance=~\"$instance\", host=~\"$host\"}[5m]))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "QPS",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (host, le) (rate(proxy_request_duration_by_host_seconds_bucket{proxy_group=~\"$proxy_group\", instance=~\"$instance\", host=~\"$host\"}[5m])))",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "P99",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (host) (rate(proxy_request_duration_by_host_seconds_count{proxy_group=~\"$proxy_group\", instance=~\"$instance\", host=~\"$host\", status=~\"5xx|error\"}[5m])) / clamp_min(sum by (host) (rate(proxy_request_duration_by_host_seconds_count{proxy_group=~\"$proxy_group\", instance=~\"$instance\", host=~\"$host\"}[5m])), 0.0001)",
+          "format": "table",
+          "instant": true,
+          "legendFormat": "error_ratio",
+          "refId": "C"
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": { "Time": true, "__name__": true, "job": true, "proxy_group": true, "instance": true, "private_ip": true },
+            "indexByName": {},
+            "renameByName": {
+              "host": "Host",
+              "Value #A": "QPS",
+              "Value #B": "P99 (s)",
+              "Value #C": "Error ratio"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "QPS" }, "properties": [{ "id": "unit", "value": "reqps" }, { "id": "decimals", "value": 2 }] },
+          { "matcher": { "id": "byName", "options": "P99 (s)" }, "properties": [{ "id": "unit", "value": "s" }, { "id": "decimals", "value": 3 }] },
+          {
+            "matcher": { "id": "byName", "options": "Error ratio" },
+            "properties": [
+              { "id": "unit", "value": "percentunit" },
+              { "id": "decimals", "value": 3 },
+              {
+                "id": "custom.cellOptions",
+                "value": { "type": "color-background" }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "orange", "value": 0.01 },
+                    { "color": "red", "value": 0.05 }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["rust-http-proxy", "victoriametrics"],
+  "templating": {
+    "list": [
+      {
+        "type": "datasource",
+        "name": "DS_VM",
+        "label": "Datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "type": "query",
+        "name": "proxy_group",
+        "label": "Proxy Group",
+        "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+        "query": { "query": "label_values(proxy_requests_total, proxy_group)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "type": "query",
+        "name": "instance",
+        "label": "Instance",
+        "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+        "query": { "query": "label_values(proxy_requests_total{proxy_group=~\"$proxy_group\"}, instance)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "sort": 1
+      },
+      {
+        "type": "query",
+        "name": "host",
+        "label": "Upstream Host",
+        "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
+        "query": { "query": "label_values(proxy_request_duration_by_host_seconds_count{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}, host)", "refId": "PrometheusVariableQueryEditor-VariableQuery" },
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".*",
+        "refresh": 2,
+        "sort": 1
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "rust-http-proxy overview",
+  "uid": "rust-http-proxy-overview",
+  "version": 1,
+  "weekStart": ""
+}
