@@ -37,8 +37,19 @@
 | `process_memory_bytes` | gauge | 常驻物理内存（字节） |
 
 ## 5. 推荐 Grafana 面板
-1. **总览**：QPS（`rate(proxy_requests_total[1m])`）、成功率
-   （`sum(rate(proxy_requests_success_total[1m]))/sum(rate(proxy_requests_total[1m]))`）
+1. **总览**：QPS（`rate(proxy_requests_total[1m])`）、成功率（**排除客户端错误口径**，见下方注解）：
+   ```promql
+   sum(rate(proxy_requests_success_total[5m]))
+   / (sum(rate(proxy_requests_success_total[5m]))
+      + sum(rate(proxy_requests_failure_total{reason!~"dns|missing_host"}[5m])))
+   ```
 2. **延迟**：`histogram_quantile(0.99, sum by (le) (rate(proxy_request_duration_seconds_bucket[5m])))`
 3. **资源**：`process_cpu_percent / 100`、`process_memory_bytes / 1024 / 1024`
 4. **DNS 命中率**：`rate(proxy_dns_cache_hits_total[1m]) / (rate(proxy_dns_cache_hits_total[1m]) + rate(proxy_dns_cache_misses_total[1m]))`
+
+> **成功率口径说明**：分母排除 `reason=dns` 与 `reason=missing_host`。这两类是客户端错误
+> （请求了不存在的域名、请求缺 Host 头），代理本身工作正常，不应拉低 SLI。若客户端在
+> 长期请求死域名，会导致此类失败 counter 持续增长，用 `rate()` 也无法完全消掉（只要还在
+> 打），因此从分母剔除。要定位具体是谁在打死域名，看 `proxy_request_duration_by_host_seconds`
+> 里 `status="error"` 的 host 分布，再结合 openobserve 日志 (`event=proxy.request` + `host=...`)
+> 反查客户端 IP。

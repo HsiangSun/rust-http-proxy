@@ -32,13 +32,14 @@
     },
     {
       "type": "stat",
-      "title": "成功率 (5m)",
+      "title": "成功率 (5m, 排除客户端错误)",
+      "description": "分母仅统计代理/上游侧的失败（reason 排除 dns、missing_host 这类客户端错误：请求了不存在的域名 / 缺少 Host 头等，不代表代理不可用）。若要看含客户端错误的原始成功率，请看下方\"QPS by status\"。",
       "id": 2,
       "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
       "datasource": { "type": "prometheus", "uid": "${DS_VM}" },
       "targets": [
         {
-          "expr": "(sum(rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)) / clamp_min((sum(rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)) + (sum(rate(proxy_requests_failure_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)), 0.0001)",
+          "expr": "(sum(rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)) / clamp_min((sum(rate(proxy_requests_success_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\"}[5m])) or vector(0)) + (sum(rate(proxy_requests_failure_total{proxy_group=~\"$proxy_group\", instance=~\"$instance\", reason!~\"dns|missing_host\"}[5m])) or vector(0)), 0.0001)",
           "refId": "A"
         }
       ],
