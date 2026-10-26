@@ -140,6 +140,38 @@ tail -f /var/log/messages | grep rust-http-proxy
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
 `rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
 
+镜像部署时，可统一使用 `server.listen = "0.0.0.0:8080"` 和
+`metrics.listen = "0.0.0.0:9090"`，通过 PF 将这两个端口限制为 VPC 内访问。
+`deploy/freebsd/pf.conf.sample` 默认允许来源 `10.3.0.0/16`，保留本机回环访问，
+拒绝其他 IPv4 来源以及 IPv6 对这两个端口的访问；其他端口和出站流量继续放行。
+该配置不包含固定的本机 IP 或网卡名称，可以随镜像复制。
+
+以下命令适用于尚未配置 PF 的主机；已有防火墙时应将端口限制合并到原规则中，
+不能用示例覆盖原有的访问限制。以 root 执行：
+
+```sh
+kldload -n pf
+pfctl -nf deploy/freebsd/pf.conf.sample
+install -m 0600 deploy/freebsd/pf.conf.sample /etc/pf.conf
+sysrc pf_enable=YES pf_rules=/etc/pf.conf pflog_enable=YES
+service pflog start
+service pf start
+service rust-http-proxy restart
+```
+
+规则中的 `log` 记录被阻断的访问。实时查看：
+
+```sh
+tcpdump -nn -e -tttt -i pflog0
+```
+
+历史日志使用 `tcpdump -nn -e -tttt -r /var/log/pflog` 读取。
+如果提示 `pflog0: No such device exists`，先执行 `service pflog start`；
+服务会加载 `pflog` 模块并自动创建接口。
+
+制作镜像前确认 `pf_enable="YES"`、`pflog_enable="YES"` 与 `rust_http_proxy_enable="YES"`。
+如果新机器位于不同 VPC，应修改 PF 中的 `vpc_net` 并执行 `service pf reload`。
+
 ## 文档
 
 - [设计与实现规范](docs/DESIGN.md)

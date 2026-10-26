@@ -1,0 +1,21 @@
+# 8080/9090 只允许来自指定 VPC 网段的 TCP 连接。
+# 不绑定网卡名或本机 IP，可随 FreeBSD 镜像复制到同一 VPC 的其他机器。
+vpc_net = "10.3.0.0/16"
+proxy_ports = "{ 8080, 9090 }"
+
+# 保留本机健康检查、Prometheus 抓取及维护访问。
+set skip on lo0
+
+# quick 确保后面的 pass 不会覆盖这些拒绝规则。
+block in log quick inet proto tcp from ! $vpc_net to any port $proxy_ports
+# 当前允许网段仅为 IPv4，拒绝这些端口的 IPv6 入站访问。
+block in log quick inet6 proto tcp from any to any port $proxy_ports
+
+# 本规则集只限制上述服务端口；其他流量（包括 SSH/DNS/DHCP）继续放行。
+pass all
+
+#实时查看日志
+#tcpdump -nn -e -tttt -i pflog0
+
+#查看已保存的日志
+#tcpdump -nn -e -tttt -r /var/log/pflog
