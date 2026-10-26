@@ -1,0 +1,42 @@
+#!/bin/sh
+#
+# PROVIDE: rust_http_proxy
+# REQUIRE: NETWORKING
+# KEYWORD: shutdown
+#
+# 在 /etc/rc.conf 中启用：
+#   rust_http_proxy_enable="YES"
+#   rust_http_proxy_config="/usr/local/rust-http-proxy/config.toml"
+#
+# 可选变量：
+#   rust_http_proxy_user      运行用户（默认 rust-proxy）
+#   rust_http_proxy_log_level RUST_LOG（默认 info）
+#
+. /etc/rc.subr
+
+name="rust_http_proxy"
+rcvar="rust_http_proxy_enable"
+
+load_rc_config "$name"
+
+: ${rust_http_proxy_enable:="NO"}
+: ${rust_http_proxy_user:="rust-proxy"}
+: ${rust_http_proxy_config:="/usr/local/rust-http-proxy/config.toml"}
+: ${rust_http_proxy_log_level:="info"}
+
+procname="/usr/local/rust-http-proxy/rust-http-proxy"
+command="/usr/sbin/daemon"
+pidfile="/var/run/${name}.pid"
+
+# 通过环境变量指定配置路径，避免依赖进程 cwd。
+export PROXY_CONFIG="${rust_http_proxy_config}"
+export RUST_LOG="${rust_http_proxy_log_level}"
+
+# -p：写 pidfile
+# -u：降权到专用用户
+# -S -T：输出走 syslog，tag 便于 journal/rsyslog 过滤
+command_args="-p ${pidfile} -u ${rust_http_proxy_user} -S -T rust-http-proxy ${procname}"
+
+required_dirs="/usr/local/rust-http-proxy"
+
+run_rc_command "$1"

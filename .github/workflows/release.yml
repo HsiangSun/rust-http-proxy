@@ -1,9 +1,11 @@
-name: Build & Release (aarch64-linux-gnu)
+name: Build & Release
 
 on:
   push:
     tags:
       - 'v*'
+  # 手动触发时只构建并上传 workflow artifact，不创建 Release。
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -63,7 +65,12 @@ jobs:
           cp config.toml                                            "dist/${STAGE}/"
           cp deploy/rust-http-proxy.service                         "dist/${STAGE}/deploy/"
           cp deploy/install.sh                                      "dist/${STAGE}/deploy/"
+          cp -R deploy/freebsd                                      "dist/${STAGE}/deploy/"
+          cp -R deploy/bench                                        "dist/${STAGE}/deploy/"
           chmod +x "dist/${STAGE}/deploy/install.sh"
+          chmod +x "dist/${STAGE}/deploy/freebsd/install.sh" \
+                   "dist/${STAGE}/deploy/freebsd/rust_http_proxy" \
+                   "dist/${STAGE}/deploy/bench/proxy_bench.py"
 
           # 文档：有就带，没有也不致命
           [ -f README.md ] && cp README.md "dist/${STAGE}/" || true
@@ -84,10 +91,104 @@ jobs:
             ${{ steps.pkg.outputs.pkg_name }}
             ${{ steps.pkg.outputs.pkg_name }}.sha256
 
+  build-freebsd:
+    name: Build aarch64-unknown-freebsd
+    runs-on: ubuntu-latest
+    # aarch64 FreeBSD 通过 QEMU 模拟编译，会比 x86_64 慢很多。
+    timeout-minutes: 300
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build on FreeBSD aarch64
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          # 在 x86_64 runner 上用 QEMU 启动 aarch64 FreeBSD。
+          arch: aarch64
+          cpu: 4
+          mem: 8192
+          # 目标部署环境固定为 FreeBSD 15.1 aarch64。
+          release: "15.1"
+          cache-after-prepare: true
+          prepare: |
+            pkg install -y rust ca_root_nss
+          run: |
+            set -eux
+            export PATH="/usr/local/bin:$PATH"
+            # QEMU 模拟 + fat LTO 极慢，改用 thin LTO / 多 codegen unit，
+            # 在可接受的 CI 时间内产出仍然经过优化的 release 二进制。
+            export CARGO_PROFILE_RELEASE_LTO=thin
+            export CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
+            export CARGO_BUILD_JOBS=4
+            export CARGO_TARGET_DIR=/tmp/cargo-target
+
+            uname -a
+            uname -m
+            rustc --version
+            cargo --version
+
+            cargo build --release --locked
+
+            VERSION="${GITHUB_REF_NAME}"
+            BIN_NAME="rust-http-proxy"
+            STAGE="${BIN_NAME}-${VERSION}"
+            PKG_NAME="${BIN_NAME}-${VERSION}-aarch64-unknown-freebsd.tar.gz"
+
+            rm -rf dist
+            mkdir -p "dist/${STAGE}/deploy"
+            cp "/tmp/cargo-target/release/${BIN_NAME}" "dist/${STAGE}/"
+            cp config.toml "dist/${STAGE}/"
+            cp -R deploy/freebsd "dist/${STAGE}/deploy/"
+            cp -R deploy/bench "dist/${STAGE}/deploy/"
+            chmod +x "dist/${STAGE}/deploy/freebsd/install.sh" \
+                     "dist/${STAGE}/deploy/freebsd/rust_http_proxy" \
+                     "dist/${STAGE}/deploy/bench/proxy_bench.py"
+            [ -f README.md ] && cp README.md "dist/${STAGE}/" || true
+            [ -d docs ] && cp -r docs "dist/${STAGE}/" || true
+
+            tar -czf "${PKG_NAME}" -C dist "${STAGE}"
+            rm -rf dist
+
+            echo "--- package ---"
+            ls -lh "${PKG_NAME}"
+            tar -tzf "${PKG_NAME}" | head -50
+
+      - name: Generate checksum
+        run: |
+          set -euxo pipefail
+          PKG_NAME="rust-http-proxy-${GITHUB_REF_NAME}-aarch64-unknown-freebsd.tar.gz"
+          sha256sum "${PKG_NAME}" > "${PKG_NAME}.sha256"
+          cat "${PKG_NAME}.sha256"
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-http-proxy-${{ github.ref_name }}-aarch64-unknown-freebsd
+          path: |
+            rust-http-proxy-${{ github.ref_name }}-aarch64-unknown-freebsd.tar.gz
+            rust-http-proxy-${{ github.ref_name }}-aarch64-unknown-freebsd.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: [build, build-freebsd]
+    # 只有打 tag 时才发布；手动 workflow_dispatch 只产出 artifacts。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Show release assets
+        run: |
+          set -euxo pipefail
+          ls -lh release-assets
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ steps.pkg.outputs.pkg_name }}
-            ${{ steps.pkg.outputs.pkg_name }}.sha256
+          files: release-assets/*
           generate_release_notes: true

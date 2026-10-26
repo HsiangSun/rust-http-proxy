@@ -16,6 +16,12 @@ set -euo pipefail
 
 # ── 解析路径 ──────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# FreeBSD 使用 rc.d + pw，而 systemd/pw 用户管理与 Linux 不同，交给专用脚本。
+if [[ "$(uname -s)" == "FreeBSD" ]]; then
+  exec /bin/sh "${SCRIPT_DIR}/freebsd/install.sh" "$@"
+fi
+
 APP_USER="rust-proxy"
 APP_GROUP="rust-proxy"
 APP_DIR="/opt/rust-http-proxy"

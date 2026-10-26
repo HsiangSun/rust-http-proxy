@@ -5,9 +5,12 @@
 - ⚡ Tokio + Hyper 1.x，多 worker SO_REUSEPORT 共享监听
 - 📈 原生 Prometheus 指标 `/metrics`（含 CPU/内存、SOCKS 预留命名空间）
 - 📝 OpenObserve 异步批量日志上报，自动以请求体 `dis_order_no` 作为 trace_id
-- 🧠 DashMap + TTL 的 DNS 缓存（默认 60s）
+- 🧠 DashMap + TTL 的 DNS 缓存（默认 60s），HTTP 与 CONNECT 共用
 - 🔁 端口复用 + 上游连接复用，缓解端口耗尽
-- 🛡️ 纯 safe Rust，全链路超时与有界反压
+- 🛡️ SSRF 防护：默认阻断私网/回环/云元数据地址、限制目标端口、支持域名黑白名单
+- 📉 有界 metrics 基数：随机域名不会造成 Prometheus label series 无界增长
+- 🐧🐡 支持 Linux 与 FreeBSD
+- 🧵 纯 safe Rust，全链路超时与有界反压
 
 ## 快速开始
 
@@ -88,9 +91,57 @@ sudo systemctl stop rust-http-proxy
 
 修改 `/opt/rust-http-proxy/config.toml` 后需 `restart` 才生效。
 
+## 安全加固
+
+`config.toml` 的 `[security]` 段控制目标地址策略，默认配置已经开启基础防护：
+
+```toml
+[security]
+block_private_ips = true          # 拒绝 127.0.0.1 / 10.x / 169.254.169.254 / ULA 等
+block_ip_literals = false         # 是否连公网 IP 字面量也拒绝
+allowed_ports = [80, 443]         # 目标端口白名单，空数组表示不限制
+domain_allowlist = []             # 非空时只放行匹配域名，支持 *.example.com
+domain_blocklist = []             # 统一拦截已知恶意/钓鱼域名，支持 *.example.com
+```
+
+- 校验同时覆盖普通 HTTP 与 HTTPS CONNECT。
+- DNS 解析完成后会再次过滤地址，防止 DNS rebinding 把公网域名切换为内网 IP。
+- `[metrics] max_host_labels` 限制 host 维度指标基数；随机域名/不存在的域名会被折叠为 `other`。
+
+## FreeBSD
+
+代码与依赖已兼容 FreeBSD（移除了 Linux 专属的 procfs process collector）。
+
+打 `v*` tag 时 GitHub Actions 会在 FreeBSD 15.1 **aarch64** VM 中额外构建
+`rust-http-proxy-<tag>-aarch64-unknown-freebsd.tar.gz`，与 Linux 包一起发布。
+aarch64 通过 QEMU 模拟编译，CI 中使用 thin LTO 以控制构建时间；该包面向
+FreeBSD 15.1+，x86_64 FreeBSD 可直接按下面步骤在目标机上构建。
+
+```bash
+# 也可以直接在 FreeBSD 上构建
+pkg install rust
+cargo build --release
+
+# 安装为 rc.d 服务（二进制与 config.toml 放在 release 包根目录）
+sudo sh deploy/freebsd/install.sh
+```
+
+服务管理：
+
+```bash
+service rust_http_proxy status
+service rust_http_proxy restart
+tail -f /var/log/messages | grep rust-http-proxy
+```
+
+内核调优参考 `deploy/freebsd/sysctl.conf.sample`（默认不自动修改系统配置）。
+可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
+`rust_http_proxy_config` 指定配置文件。
+
 ## 文档
 
 - [设计与实现规范](docs/DESIGN.md)
 - [指标手册](docs/METRICS.md)
 - [可观测：VictoriaMetrics 抓取 + Grafana Dashboard](docs/OBSERVABILITY.md)
 - [Grafana Dashboard JSON](docs/grafana-dashboard.json)
+- [压测工具](deploy/bench/README.md)

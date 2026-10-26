@@ -21,6 +21,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # FreeBSD 目标用于跨平台编译检查（cargo check 不需要链接器）。
+          targets: x86_64-unknown-freebsd
 
       - name: Cargo cache
         uses: Swatinem/rust-cache@v2
@@ -33,3 +35,6 @@ jobs:
 
       - name: cargo check
         run: cargo check --all-targets
+
+      - name: cargo check (FreeBSD)
+        run: cargo check --all-targets --target x86_64-unknown-freebsd

@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1783097699316,
+  "lastScanned": 1783335649436,
   "projectRoot": "/home/sean/code/rustCode/rust-http-proxy",
   "techStack": {
     "languages": [
@@ -45,7 +45,7 @@
       "path": "deploy",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1783097699311,
+      "lastAccessed": 1783335649434,
       "keyFiles": [
         "install.sh",
         "rust-http-proxy.service"
@@ -55,7 +55,7 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 4,
-      "lastAccessed": 1783097699313,
+      "lastAccessed": 1783335649434,
       "keyFiles": [
         "DESIGN.md",
         "METRICS.md",
@@ -67,7 +67,7 @@
       "path": "src",
       "purpose": "Source code",
       "fileCount": 8,
-      "lastAccessed": 1783097699314,
+      "lastAccessed": 1783335649435,
       "keyFiles": [
         "config.rs",
         "dns.rs",
@@ -80,7 +80,7 @@
       "path": "target",
       "purpose": null,
       "fileCount": 2,
-      "lastAccessed": 1783097699314,
+      "lastAccessed": 1783335649436,
       "keyFiles": [
         "CACHEDIR.TAG"
       ]
@@ -89,14 +89,14 @@
   "hotPaths": [
     {
       "path": "docs/grafana-dashboard.json",
-      "accessCount": 7,
-      "lastAccessed": 1783099999466,
+      "accessCount": 9,
+      "lastAccessed": 1783336898547,
       "type": "file"
     },
     {
       "path": "src/proxy.rs",
-      "accessCount": 4,
-      "lastAccessed": 1783099519722,
+      "accessCount": 5,
+      "lastAccessed": 1783335993534,
       "type": "file"
     },
     {
@@ -109,6 +109,12 @@
       "path": "README.md",
       "accessCount": 3,
       "lastAccessed": 1783098830530,
+      "type": "file"
+    },
+    {
+      "path": "docs/METRICS.md",
+      "accessCount": 2,
+      "lastAccessed": 1783336926697,
       "type": "file"
     },
     {
@@ -133,6 +139,12 @@
       "path": "deploy/sysctl.d/99-rust-http-proxy.conf",
       "accessCount": 1,
       "lastAccessed": 1783098830101,
+      "type": "file"
+    },
+    {
+      "path": "src/metrics.rs",
+      "accessCount": 1,
+      "lastAccessed": 1783335988027,
       "type": "file"
     }
   ],

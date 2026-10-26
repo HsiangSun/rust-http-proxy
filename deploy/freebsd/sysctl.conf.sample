@@ -1,0 +1,22 @@
+# rust-http-proxy —— FreeBSD 内核调优参考
+#
+# 把需要的行追加到 /etc/sysctl.conf，然后执行：
+#   service sysctl restart        # 或重启系统
+#
+# 注意：这些不是必需的；请结合机器内存与业务并发量调整。
+
+# ── 文件描述符 ────────────────────────────────────────────────────────────
+kern.maxfiles=2097152
+kern.maxfilesperproc=1048576
+
+# ── 监听队列 / 三次握手 backlog ───────────────────────────────────────────
+kern.ipc.somaxconn=65535
+
+# ── 出向连接端口范围 ─────────────────────────────────────────────────────
+net.inet.ip.portrange.first=1024
+net.inet.ip.portrange.last=65535
+
+# ── TCP keepalive（单位：毫秒） ───────────────────────────────────────────
+net.inet.tcp.keepidle=300000
+net.inet.tcp.keepintvl=30000
+net.inet.tcp.keepcnt=3

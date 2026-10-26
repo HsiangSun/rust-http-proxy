@@ -24,12 +24,18 @@ io_timeout_secs = 60
 [metrics]
 # Prometheus 指标暴露地址 (GET /metrics)。
 listen = "0.0.0.0:9090"
+# 按 host 维度的耗时直方图最多保留多少个 host 标签。
+# 随机域名（尤其是无法解析的域名）会不断制造新的 label series，
+# 超过该上限后新 host 统一折叠为 other，避免内存缓慢上涨。
+max_host_labels = 1024
 
 [dns]
 # 缓存 TTL（秒）。题目要求 1 分钟。
 ttl_secs = 60
-# 缓存最大条目数，超过后按 LRU-like 方式淘汰最旧条目。
+# 缓存最大条目数，超过后优先淘汰过期条目，不够再随机驱逐。
 max_entries = 10_000
+# 单次 DNS 解析超时（秒）。异常 DNS 环境下避免请求长期挂起。
+timeout_secs = 5
 
 [upstream]
 # 上游 keep-alive 连接池每个 host 的最大空闲连接数。
@@ -38,6 +44,20 @@ pool_max_idle_per_host = 64
 pool_idle_timeout_secs = 90
 # 建连超时（秒）。
 connect_timeout_secs = 10
+
+[security]
+# 禁止访问私网/回环/链路本地/组播/保留地址（防 SSRF、云元数据、DNS rebinding）。
+# 强烈建议保持 true。
+block_private_ips = true
+# 禁止客户端直接使用 IP 字面量作为目标；如需直连公网 IP 可设为 false。
+block_ip_literals = false
+# 允许的目标端口；为空表示不限制。默认只放行 HTTP/HTTPS。
+allowed_ports = [80, 443]
+# 域名白名单：非空时只允许匹配的目标，例如 ["*.example.com", "api.partner.com"]。
+domain_allowlist = []
+# 域名黑名单：匹配的目标一律拒绝，例如 ["*.phishing.example", "bad.example"]。
+# 用于在网关侧统一拦截已知恶意/钓鱼域名。
+domain_blocklist = []
 
 [openobserve]
 # 是否启用日志上报。

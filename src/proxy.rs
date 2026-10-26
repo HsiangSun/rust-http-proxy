@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
+use hyper::http::uri::Authority;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
 use hyper::{header, Method, Request, Response, StatusCode, Uri};
@@ -39,9 +40,10 @@ use crate::config::UpstreamConfig;
 use crate::dns::DnsCache;
 use crate::logger::{LogEntry, LogSink};
 use crate::metrics::Metrics;
+use crate::security::{SafeResolver, SecurityError, SecurityPolicy};
 
 /// 复用的 hyper HTTP/1 上游客户端类型别名。请求体使用 `Full<Bytes>`。
-pub type HttpClient = Client<HttpConnector, Full<Bytes>>;
+pub type HttpClient = Client<HttpConnector<SafeResolver>, Full<Bytes>>;
 
 /// 代理处理上下文，所有请求处理函数共享同一份只读引用。
 #[derive(Clone)]
@@ -50,6 +52,8 @@ pub struct ProxyContext {
     pub dns: Arc<DnsCache>,
     pub log: LogSink,
     pub upstream: UpstreamConfig,
+    /// 目标地址安全策略（SSRF / 端口 / 域名黑白名单）。
+    pub security: Arc<SecurityPolicy>,
     pub io_timeout: Duration,
     /// 复用 keep-alive 的 HTTP/1 上游客户端；自带连接池。
     pub http_client: HttpClient,
@@ -60,8 +64,14 @@ pub struct ProxyContext {
 /// 池由 `pool_max_idle_per_host` / `pool_idle_timeout_secs` 控制；
 /// 通过对相同上游目标的 keep-alive 复用，显著减少 TCP 建连与本机
 /// 出向端口消耗（避免高并发下 `EADDRNOTAVAIL`）。
-pub fn build_http_client(cfg: &UpstreamConfig) -> HttpClient {
-    let mut connector = HttpConnector::new();
+pub fn build_http_client(
+    cfg: &UpstreamConfig,
+    dns: Arc<DnsCache>,
+    security: Arc<SecurityPolicy>,
+) -> HttpClient {
+    // 用自定义解析器替换默认 getaddrinfo：复用 DnsCache，并在建连前按
+    // 安全策略过滤私网/保留地址（防 DNS rebinding 绕过）。
+    let mut connector = HttpConnector::new_with_resolver(SafeResolver::new(dns, security));
     connector.set_nodelay(true);
     connector.set_connect_timeout(Some(Duration::from_secs(cfg.connect_timeout_secs)));
     connector.enforce_http(true); // 仅 HTTP（HTTPS 走 CONNECT 隧道路径）。
@@ -126,10 +136,11 @@ async fn handle_request(
                 .inc();
             ctx.metrics.request_duration.observe(elapsed_secs);
             // host 维度耗时：用真实上游响应码的 status class。
-            ctx.metrics
-                .request_duration_by_host
-                .with_label_values(&[&host_port, crate::metrics::status_class(status_code)])
-                .observe(elapsed_secs);
+            ctx.metrics.observe_by_host(
+                &host_port,
+                crate::metrics::status_class(status_code),
+                elapsed_secs,
+            );
             Ok(resp)
         }
         Err((err, host_port_opt)) => {
@@ -142,9 +153,7 @@ async fn handle_request(
             // 失败也按 host 计入耗时，host 未知则用 "unknown"，status=error。
             let host_label = host_port_opt.as_deref().unwrap_or("unknown");
             ctx.metrics
-                .request_duration_by_host
-                .with_label_values(&[host_label, "error"])
-                .observe(elapsed_secs);
+                .observe_by_host(host_label, "error", elapsed_secs);
             Ok(build_error_response(err.status(), err.to_string()))
         }
     }
@@ -155,6 +164,10 @@ async fn handle_request(
 enum ForwardError {
     #[error("缺少 host 信息")]
     MissingHost,
+    #[error("DNS 解析失败: {0}")]
+    Dns(String),
+    #[error("目标被安全策略拒绝: {0}")]
+    Blocked(SecurityError),
     #[error("上游请求失败: {0}")]
     Upstream(String),
     #[error("请求体读取失败: {0}")]
@@ -172,6 +185,8 @@ impl ForwardError {
     fn reason(&self) -> &'static str {
         match self {
             ForwardError::MissingHost => "missing_host",
+            ForwardError::Dns(_) => "dns",
+            ForwardError::Blocked(_) => "blocked",
             ForwardError::Upstream(s) => {
                 if s.contains("connect") {
                     "connect"
@@ -189,6 +204,7 @@ impl ForwardError {
     fn status(&self) -> StatusCode {
         match self {
             ForwardError::MissingHost => StatusCode::BAD_REQUEST,
+            ForwardError::Blocked(_) => StatusCode::FORBIDDEN,
             ForwardError::Timeout => StatusCode::GATEWAY_TIMEOUT,
             _ => StatusCode::BAD_GATEWAY,
         }
@@ -206,8 +222,40 @@ async fn forward_http(
     ctx: &Arc<ProxyContext>,
 ) -> Result<(Response<Full<Bytes>>, String, u16), (ForwardError, Option<String>)> {
     // 解析目标 host:port。代理收到的请求通常带绝对 URI；若没有，从 Host 头补齐。
-    let (host, port) = extract_host_port(&req).map_err(|e| (e, None))?;
-    let host_port = format!("{host}:{port}");
+    let (raw_host, port) = extract_host_port(&req).map_err(|e| (e, None))?;
+
+    // 第一层校验：域名格式、端口白名单、IP 字面量、域名黑白名单。
+    let host = match ctx.security.check_target(&raw_host, port) {
+        Ok(host) => host,
+        Err(e) => {
+            ctx.metrics
+                .security_blocked_total
+                .with_label_values(&[e.reason()])
+                .inc();
+            let host_port = format_authority(&raw_host, port);
+            warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "HTTP 目标被安全策略拒绝");
+            return Err((ForwardError::Blocked(e), Some(host_port)));
+        }
+    };
+    let host_port = format_authority(&host, port);
+
+    // 预先解析并过滤地址：既能尽早给出 403、顺便预热 DNS 缓存，也让后续
+    // hyper 连接池在新建连接时拿到同一份经过安全过滤的地址。
+    let addrs = match ctx.dns.lookup_host(&host, port).await {
+        Ok(addrs) => addrs,
+        Err(e) => {
+            warn!(client = %peer, host = %host_port, kind = ?e.kind(), error = %e, "HTTP DNS 解析失败");
+            return Err((ForwardError::Dns(e.to_string()), Some(host_port)));
+        }
+    };
+    if let Err(e) = ctx.security.filter_addrs(&host, addrs) {
+        ctx.metrics
+            .security_blocked_total
+            .with_label_values(&[e.reason()])
+            .inc();
+        warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "HTTP 目标解析到受限地址");
+        return Err((ForwardError::Blocked(e), Some(host_port)));
+    }
 
     // 收集请求体；按优先级生成 trace_id：
     // header `X-PROXY-TRACE-ID` > 请求体 `dis_order_no` > UUID。
@@ -308,16 +356,37 @@ async fn handle_connect(
                 .with_label_values(&["missing_host"])
                 .inc();
             ctx.metrics
-                .request_duration_by_host
-                .with_label_values(&["unknown", "error"])
-                .observe(started.elapsed().as_secs_f64());
+                .observe_by_host("unknown", "error", started.elapsed().as_secs_f64());
             return build_error_response(StatusCode::BAD_REQUEST, "CONNECT 缺少 authority");
         }
     };
-    let host_port = authority.to_string();
+    let raw_host = authority.host().to_string();
+    // CONNECT 的 authority 按 RFC 应带端口；缺失时按 HTTPS 默认 443 处理。
+    let port = authority.port_u16().unwrap_or(443);
+
+    // 第一层校验：域名格式、端口白名单、IP 字面量、域名黑白名单。
+    let host = match ctx.security.check_target(&raw_host, port) {
+        Ok(host) => host,
+        Err(e) => {
+            ctx.metrics
+                .security_blocked_total
+                .with_label_values(&[e.reason()])
+                .inc();
+            ctx.metrics
+                .requests_failure
+                .with_label_values(&["blocked"])
+                .inc();
+            let host_port = format_authority(&raw_host, port);
+            ctx.metrics
+                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
+            warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "CONNECT 目标被安全策略拒绝");
+            return build_error_response(StatusCode::FORBIDDEN, format!("目标被拒绝: {e}"));
+        }
+    };
+    let host_port = format_authority(&host, port);
 
     // 与上游建立 TCP。CONNECT 隧道每次都需要独立连接（端到端 TLS）。
-    let addrs = match ctx.dns.lookup(&host_port).await {
+    let addrs = match ctx.dns.lookup_host(&host, port).await {
         Ok(v) => v,
         Err(e) => {
             warn!(client = %peer, host = %host_port, kind = ?e.kind(), error = %e, "CONNECT DNS 解析失败");
@@ -326,10 +395,26 @@ async fn handle_connect(
                 .with_label_values(&["dns"])
                 .inc();
             ctx.metrics
-                .request_duration_by_host
-                .with_label_values(&[&host_port, "error"])
-                .observe(started.elapsed().as_secs_f64());
+                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
             return build_error_response(StatusCode::BAD_GATEWAY, format!("DNS 失败: {e}"));
+        }
+    };
+    // 第二层校验：解析结果不能落入私网/保留地址（防 DNS rebinding）。
+    let addrs = match ctx.security.filter_addrs(&host, addrs) {
+        Ok(v) => v,
+        Err(e) => {
+            ctx.metrics
+                .security_blocked_total
+                .with_label_values(&[e.reason()])
+                .inc();
+            ctx.metrics
+                .requests_failure
+                .with_label_values(&["blocked"])
+                .inc();
+            ctx.metrics
+                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
+            warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "CONNECT 目标解析到受限地址");
+            return build_error_response(StatusCode::FORBIDDEN, format!("目标被拒绝: {e}"));
         }
     };
     let target = addrs[0];
@@ -349,9 +434,7 @@ async fn handle_connect(
                 .with_label_values(&["connect"])
                 .inc();
             ctx.metrics
-                .request_duration_by_host
-                .with_label_values(&[&host_port, "error"])
-                .observe(started.elapsed().as_secs_f64());
+                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
             return build_error_response(StatusCode::BAD_GATEWAY, format!("建连失败: {e}"));
         }
         Err(_) => {
@@ -361,9 +444,7 @@ async fn handle_connect(
                 .with_label_values(&["timeout"])
                 .inc();
             ctx.metrics
-                .request_duration_by_host
-                .with_label_values(&[&host_port, "error"])
-                .observe(started.elapsed().as_secs_f64());
+                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
             return build_error_response(StatusCode::GATEWAY_TIMEOUT, "建连超时");
         }
     };
@@ -398,10 +479,7 @@ async fn handle_connect(
                 metrics.bytes_down.inc_by(down);
                 let elapsed_secs = started.elapsed().as_secs_f64();
                 // 隧道整体生命周期耗时纳入按 host 视图，status=tunnel。
-                metrics
-                    .request_duration_by_host
-                    .with_label_values(&[&log_host, "tunnel"])
-                    .observe(elapsed_secs);
+                metrics.observe_by_host(&log_host, "tunnel", elapsed_secs);
                 log.emit(LogEntry {
                     timestamp: now_rfc3339(),
                     trace_id,
@@ -473,8 +551,11 @@ where
 }
 
 /// 提取 `host:port`。优先用 URI authority，其次用 Host 头。
+///
+/// Host 头通过 [`Authority`] 解析，避免手写 `rsplit_once(':')` 在 IPv6
+/// 字面量（`[::1]:8080`）上解析错误。
 fn extract_host_port(req: &Request<Incoming>) -> Result<(String, u16), ForwardError> {
-    if let Some(authority) = req.uri().authority().cloned() {
+    if let Some(authority) = req.uri().authority() {
         let host = authority.host().to_string();
         let port = authority
             .port_u16()
@@ -486,14 +567,40 @@ fn extract_host_port(req: &Request<Incoming>) -> Result<(String, u16), ForwardEr
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
     {
-        if let Some((host, port)) = host_header.rsplit_once(':') {
-            if let Ok(p) = port.parse::<u16>() {
-                return Ok((host.to_string(), p));
-            }
+        if let Ok(authority) = host_header.parse::<Authority>() {
+            return Ok((
+                authority.host().to_string(),
+                authority
+                    .port_u16()
+                    .unwrap_or_else(|| default_port(req.uri())),
+            ));
         }
+        // 解析失败时先把原始值交给安全策略的格式校验，统一返回 403。
         return Ok((host_header.to_string(), default_port(req.uri())));
     }
     Err(ForwardError::MissingHost)
+}
+
+/// 格式化 `host:port`，IPv6 自动加方括号（用于日志 / metrics）。
+fn format_authority(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+/// 格式化 URI 的 authority（80 端口可省略）。
+fn format_uri_authority(host: &str, port: u16) -> String {
+    if port == 80 {
+        if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        }
+    } else {
+        format_authority(host, port)
+    }
 }
 
 /// HTTP 默认端口推断。
@@ -522,11 +629,12 @@ fn build_upstream_request_for_pool(
         .map(|p| p.as_str().to_string())
         .unwrap_or_else(|| "/".to_string());
     // 默认 80 端口在 URI 中可省略；非 80 端口需要显式带上。
-    let absolute = if port == 80 {
-        format!("http://{host}{path_and_query}")
-    } else {
-        format!("http://{host}:{port}{path_and_query}")
-    };
+    // IPv6 字面量必须使用方括号形式。
+    let absolute = format!(
+        "http://{}{}",
+        format_uri_authority(host, port),
+        path_and_query
+    );
 
     let mut builder = Request::builder()
         .method(parts.method.clone())

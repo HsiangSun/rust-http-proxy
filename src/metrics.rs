@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use dashmap::DashSet;
 use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
@@ -67,11 +68,24 @@ pub struct Metrics {
     pub process_cpu_percent: IntGauge,
     /// 进程常驻内存（字节）。
     pub process_memory_bytes: IntGauge,
+    /// 当前 DNS 缓存条目数（用于观察缓存是否被长尾域名打满）。
+    pub dns_cache_entries: IntGauge,
+    /// 被安全策略拦截的目标计数（按原因分类）。
+    pub security_blocked_total: IntCounterVec,
+    /// host 维度指标标签溢出次数（新 host 被折叠为 `other`）。
+    pub host_label_overflow_total: IntCounter,
+    /// 已登记的 host 标签集合，用于限制 Prometheus 基数。
+    host_labels: DashSet<String>,
+    /// host 标签数量上限。
+    max_host_labels: usize,
 }
 
 impl Metrics {
     /// 构造并向全局 Registry 注册所有指标。
-    pub fn new() -> anyhow::Result<Self> {
+    ///
+    /// `max_host_labels` 限制按 host 分维的直方图基数，防止随机域名造成
+    /// Prometheus label series 无界增长。
+    pub fn new(max_host_labels: usize) -> anyhow::Result<Self> {
         let requests_total = IntCounter::new("proxy_requests_total", "代理收到的请求总数")?;
         let requests_success = IntCounterVec::new(
             Opts::new("proxy_requests_success_total", "处理成功的请求计数"),
@@ -123,6 +137,15 @@ impl Metrics {
             IntGauge::new("process_cpu_percent", "代理进程 CPU 使用率（百分比 *100）")?;
         let process_memory_bytes =
             IntGauge::new("process_memory_bytes", "代理进程常驻内存（字节）")?;
+        let dns_cache_entries = IntGauge::new("proxy_dns_cache_entries", "当前 DNS 缓存条目数")?;
+        let security_blocked_total = IntCounterVec::new(
+            Opts::new("proxy_security_blocked_total", "被安全策略拦截的目标计数"),
+            &["reason"],
+        )?;
+        let host_label_overflow_total = IntCounter::new(
+            "proxy_metrics_host_label_overflow_total",
+            "按 host 维度指标标签溢出次数",
+        )?;
 
         // 统一注册到全局 Registry。
         let r = &*REGISTRY;
@@ -143,6 +166,9 @@ impl Metrics {
         r.register(Box::new(socks_active_sessions.clone()))?;
         r.register(Box::new(process_cpu_percent.clone()))?;
         r.register(Box::new(process_memory_bytes.clone()))?;
+        r.register(Box::new(dns_cache_entries.clone()))?;
+        r.register(Box::new(security_blocked_total.clone()))?;
+        r.register(Box::new(host_label_overflow_total.clone()))?;
 
         Ok(Self {
             requests_total,
@@ -162,7 +188,40 @@ impl Metrics {
             socks_active_sessions,
             process_cpu_percent,
             process_memory_bytes,
+            dns_cache_entries,
+            security_blocked_total,
+            host_label_overflow_total,
+            host_labels: DashSet::new(),
+            max_host_labels: max_host_labels.max(1),
         })
+    }
+
+    /// 记录一次按 host 分维的耗时。
+    ///
+    /// host 标签基数由 `max_host_labels` 限制：超过上限后新 host 统一记为
+    /// `other`，避免随机域名 / 不存在的域名把内存吃满。
+    pub fn observe_by_host(&self, host: &str, status: &str, secs: f64) {
+        let label = self.host_label(host);
+        self.request_duration_by_host
+            .with_label_values(&[label, status])
+            .observe(secs);
+    }
+
+    /// 返回可安全用作 Prometheus label 的 host。
+    fn host_label<'a>(&'a self, host: &'a str) -> &'a str {
+        // 超长 host 不纳入标签，避免单条 label 过大。
+        if host.len() > 255 {
+            return "invalid";
+        }
+        if self.host_labels.contains(host) {
+            return host;
+        }
+        if self.host_labels.len() >= self.max_host_labels {
+            self.host_label_overflow_total.inc();
+            return "other";
+        }
+        self.host_labels.insert(host.to_string());
+        host
     }
 
     /// 将当前 Registry 中的所有指标渲染成 Prometheus 文本格式。
@@ -179,7 +238,7 @@ impl Metrics {
 /// 启动一个后台任务，每 5 秒采样一次进程的 CPU/内存占用并写入 gauge。
 ///
 /// 之所以独立成 task：`sysinfo::System` 的刷新本身需要短暂阻塞读取
-/// `/proc`，放在请求路径会影响延迟。
+/// 系统信息（Linux 为 `/proc`，FreeBSD 为 sysctl），放在请求路径会影响延迟。
 pub fn spawn_process_sampler(metrics: Arc<Metrics>) {
     tokio::spawn(async move {
         // 当前进程 PID。
@@ -222,5 +281,22 @@ pub fn status_class(code: u16) -> &'static str {
         400..=499 => "4xx",
         500..=599 => "5xx",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_labels_are_bounded() {
+        let metrics = Metrics::new(2).expect("metrics registry");
+        metrics.observe_by_host("a.example:80", "error", 0.1);
+        metrics.observe_by_host("b.example:80", "error", 0.1);
+        metrics.observe_by_host("c.example:80", "error", 0.1);
+
+        assert_eq!(metrics.host_labels.len(), 2);
+        assert_eq!(metrics.host_label_overflow_total.get(), 1);
+        assert_eq!(metrics.host_label("c.example:80"), "other");
     }
 }
