@@ -129,14 +129,16 @@ sudo sh deploy/freebsd/install.sh
 服务管理：
 
 ```bash
-service rust_http_proxy status
-service rust_http_proxy restart
+service rust-http-proxy status
+service rust-http-proxy stop
+service rust-http-proxy start
+service rust-http-proxy restart
 tail -f /var/log/messages | grep rust-http-proxy
 ```
 
 内核调优参考 `deploy/freebsd/sysctl.conf.sample`（默认不自动修改系统配置）。
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
-`rust_http_proxy_config` 指定配置文件。
+`rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
 
 ## 文档
 

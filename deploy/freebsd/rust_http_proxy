@@ -4,6 +4,10 @@
 # REQUIRE: NETWORKING
 # KEYWORD: shutdown
 #
+# 安装为 /usr/local/etc/rc.d/rust-http-proxy：
+#   service rust-http-proxy start|stop|status|restart
+# rc.conf 的变量名仍使用下划线，符合 shell 变量命名规则。
+#
 # 在 /etc/rc.conf 中启用：
 #   rust_http_proxy_enable="YES"
 #   rust_http_proxy_config="/usr/local/rust-http-proxy/config.toml"
@@ -21,21 +25,40 @@ load_rc_config "$name"
 
 : ${rust_http_proxy_enable:="NO"}
 : ${rust_http_proxy_user:="rust-proxy"}
+: ${rust_http_proxy_group:="rust-proxy"}
 : ${rust_http_proxy_config:="/usr/local/rust-http-proxy/config.toml"}
 : ${rust_http_proxy_log_level:="info"}
 
+# ${name}_user 会触发 rc.subr 的 su，导致 daemon -u 再次设置用户组失败。
+# 保留 rc.conf 的配置接口，但仅由以 root 启动的 daemon 执行降权。
+_rust_http_proxy_user="${rust_http_proxy_user}"
+unset rust_http_proxy_user
+
 procname="/usr/local/rust-http-proxy/rust-http-proxy"
 command="/usr/sbin/daemon"
-pidfile="/var/run/${name}.pid"
 
-# 通过环境变量指定配置路径，避免依赖进程 cwd。
-export PROXY_CONFIG="${rust_http_proxy_config}"
-export RUST_LOG="${rust_http_proxy_log_level}"
+# 保留独立的运行目录；daemon 在降权前打开 pidfile。
+rundir="/var/run/${name}"
+pidfile="${rundir}/${name}.pid"
 
-# -p：写 pidfile
-# -u：降权到专用用户
-# -S -T：输出走 syslog，tag 便于 journal/rsyslog 过滤
-command_args="-p ${pidfile} -u ${rust_http_proxy_user} -S -T rust-http-proxy ${procname}"
+# 启动前确保运行目录存在且属主正确（/var/run 重启后会清空）。
+rust_http_proxy_prestart()
+{
+    mkdir -p "${rundir}" || return 1
+    chown "${_rust_http_proxy_user}:${rust_http_proxy_group}" "${rundir}" || return 1
+    chmod 0755 "${rundir}"
+}
+start_precmd="rust_http_proxy_prestart"
+
+# -p 保存代理子进程 PID，与 procname 配合供 status/stop 使用。
+# -f 关闭继承的标准输入输出，避免占用启动服务的 SSH 会话。
+# -u 仅降权一次；-S -T 将输出写入 syslog。
+# 在 daemon 设置用户环境后传入配置路径与日志级别，避免依赖 cwd。
+command_args="-f -p \"${pidfile}\" -u \"${_rust_http_proxy_user}\" -S -T rust-http-proxy \
+    /usr/bin/env \
+    PROXY_CONFIG=\"${rust_http_proxy_config}\" \
+    RUST_LOG=\"${rust_http_proxy_log_level}\" \
+    \"${procname}\""
 
 required_dirs="/usr/local/rust-http-proxy"
 
