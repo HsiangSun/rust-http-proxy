@@ -6,7 +6,7 @@
 //! 3. 构造 metrics / DNS 缓存 / 日志 sink 等共享组件。
 //! 4. 启动 `/metrics` HTTP 服务。
 //! 5. 按 worker 数启动 N 个绑定相同端口（SO_REUSEPORT）的 accept 循环。
-//! 6. 等待 Ctrl+C 完成优雅退出。
+//! 6. 等待 SIGINT / SIGTERM 完成优雅退出。
 
 use std::net::SocketAddr;
 use std::str::FromStr;
@@ -23,6 +23,7 @@ mod logger;
 mod metrics;
 mod metrics_server;
 mod proxy;
+mod security;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -34,18 +35,22 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let cfg = config::Config::load("config.toml")?;
-    info!("配置加载完成");
+    // 配置路径可通过 PROXY_CONFIG 指定（FreeBSD rc.d 等场景不必依赖 cwd）。
+    let cfg_path = std::env::var("PROXY_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
+    let cfg = config::Config::load(&cfg_path)?;
+    info!(config = %cfg_path, "配置加载完成");
 
     // 构造共享组件。
-    let metrics = Arc::new(metrics::Metrics::new()?);
+    let metrics = Arc::new(metrics::Metrics::new(cfg.metrics.max_host_labels)?);
     metrics::spawn_process_sampler(metrics.clone());
 
     let dns_cache = Arc::new(dns::DnsCache::new(
         Duration::from_secs(cfg.dns.ttl_secs),
         cfg.dns.max_entries,
+        Duration::from_secs(cfg.dns.timeout_secs),
         metrics.clone(),
     ));
+    let security = Arc::new(security::SecurityPolicy::from_config(&cfg.security));
     let log_sink = logger::spawn(cfg.openobserve.clone());
 
     // 启动 metrics HTTP 服务。
@@ -68,13 +73,14 @@ async fn main() -> anyhow::Result<()> {
     };
     info!(%proxy_addr, workers, "代理监听启动");
 
-    let http_client = proxy::build_http_client(&cfg.upstream);
+    let http_client = proxy::build_http_client(&cfg.upstream, dns_cache.clone(), security.clone());
 
     let ctx = Arc::new(proxy::ProxyContext {
         metrics: metrics.clone(),
         dns: dns_cache.clone(),
         log: log_sink.clone(),
         upstream: cfg.upstream.clone(),
+        security,
         io_timeout: Duration::from_secs(cfg.server.io_timeout_secs),
         http_client,
     });
@@ -88,9 +94,28 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    // 优雅退出：等待 Ctrl+C。
-    tokio::signal::ctrl_c().await?;
-    info!("收到 Ctrl+C，准备退出");
+    // 优雅退出：Linux/systemd 通常发 SIGTERM，FreeBSD rc.d 也会用 SIGTERM
+    // 停止 daemon；交互场景则是 SIGINT（Ctrl+C）。
+    wait_for_shutdown_signal().await?;
+    info!("收到退出信号，准备退出");
+    Ok(())
+}
+
+/// 等待 SIGINT 或 SIGTERM。
+async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
     Ok(())
 }
 

@@ -23,6 +23,9 @@ pub struct Config {
     /// 上游连接池配置。
     #[serde(default)]
     pub upstream: UpstreamConfig,
+    /// 访问目标安全策略（SSRF / 钓鱼域名防护）。
+    #[serde(default)]
+    pub security: SecurityConfig,
     /// OpenObserve 日志上报配置。
     #[serde(default)]
     pub openobserve: OpenObserveConfig,
@@ -54,12 +57,24 @@ impl Default for ServerConfig {
 pub struct MetricsConfig {
     /// `/metrics` HTTP 接口监听地址。
     pub listen: String,
+    /// 按 host 维度的耗时直方图最多保留多少个不同 host 标签。
+    ///
+    /// 该上限用于保护内存：恶意客户端可以请求海量随机域名（尤其是无法解析
+    /// 的域名），若每个 host 都生成一个 Prometheus label series，内存会无界
+    /// 增长。达到上限后新的 host 统一折叠为 `other`。
+    #[serde(default = "default_max_host_labels")]
+    pub max_host_labels: usize,
+}
+
+fn default_max_host_labels() -> usize {
+    1024
 }
 
 impl Default for MetricsConfig {
     fn default() -> Self {
         Self {
             listen: "0.0.0.0:9090".to_string(),
+            max_host_labels: default_max_host_labels(),
         }
     }
 }
@@ -71,6 +86,14 @@ pub struct DnsConfig {
     pub ttl_secs: u64,
     /// 最大缓存条目数，防止解析极多域名时内存膨胀。
     pub max_entries: usize,
+    /// 单次 DNS 解析超时（秒）。getaddrinfo 在异常 DNS 环境下可能长时间
+    /// 阻塞，必须有上限，避免请求 task 与连接长期挂起。
+    #[serde(default = "default_dns_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_dns_timeout() -> u64 {
+    5
 }
 
 impl Default for DnsConfig {
@@ -78,6 +101,7 @@ impl Default for DnsConfig {
         Self {
             ttl_secs: 60,
             max_entries: 10_000,
+            timeout_secs: default_dns_timeout(),
         }
     }
 }
@@ -104,6 +128,57 @@ impl Default for UpstreamConfig {
             pool_max_idle_per_host: 64,
             pool_idle_timeout_secs: 90,
             connect_timeout_secs: 10,
+        }
+    }
+}
+
+/// 访问目标安全策略。
+///
+/// 正向代理天然是一个 SSRF 放大器：如果允许客户端任意指定目标，攻击者就能
+/// 借代理访问内网、云元数据地址（169.254.169.254）、本机管理端口等。
+/// 这里提供三层防护：
+///
+/// 1. 禁止解析结果落入私网 / 保留地址（默认开启）；
+/// 2. 目标端口白名单（默认只允许 80/443）；
+/// 3. 可选域名白名单 / 黑名单（支持 `*.example.com` 通配）。
+///
+/// 所有校验同时作用于普通 HTTP 转发与 HTTPS CONNECT 隧道；并且在 DNS
+/// 解析完成后再次过滤地址，以抵御 DNS rebinding。
+#[derive(Debug, Clone, Deserialize)]
+pub struct SecurityConfig {
+    /// 是否禁止访问私网 / 回环 / 链路本地 / 组播 / 保留地址。
+    #[serde(default = "default_true")]
+    pub block_private_ips: bool,
+    /// 是否禁止客户端直接使用 IP 字面量作为目标。
+    #[serde(default)]
+    pub block_ip_literals: bool,
+    /// 允许的目标端口；为空表示不限制。默认仅 80/443。
+    #[serde(default = "default_allowed_ports")]
+    pub allowed_ports: Vec<u16>,
+    /// 域名白名单；非空时只允许匹配的目标。
+    #[serde(default)]
+    pub domain_allowlist: Vec<String>,
+    /// 域名黑名单；匹配的目标一律拒绝。
+    #[serde(default)]
+    pub domain_blocklist: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_allowed_ports() -> Vec<u16> {
+    vec![80, 443]
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            block_private_ips: true,
+            block_ip_literals: false,
+            allowed_ports: default_allowed_ports(),
+            domain_allowlist: Vec::new(),
+            domain_blocklist: Vec::new(),
         }
     }
 }

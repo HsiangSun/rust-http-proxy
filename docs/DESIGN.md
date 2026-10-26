@@ -69,8 +69,9 @@
 |------|------|------|
 | 配置 | `src/config.rs` | TOML + 环境变量加载 |
 | 监听器 | `src/listener.rs` | `SO_REUSEADDR/SO_REUSEPORT` Socket 构造 |
-| DNS | `src/dns.rs` | TTL 缓存 + 容量保护 |
-| Metrics | `src/metrics.rs` | Prometheus 指标定义与进程采样 |
+| DNS | `src/dns.rs` | TTL 缓存 + 容量保护（按域名缓存 IP） |
+| 安全策略 | `src/security.rs` | SSRF 防护、端口/域名黑白名单、DNS resolver |
+| Metrics | `src/metrics.rs` | Prometheus 指标定义、有界 host 基数与进程采样 |
 | Metrics HTTP | `src/metrics_server.rs` | `/metrics` 端点 |
 | 日志 | `src/logger.rs` | OpenObserve 异步批量上报 |
 | 代理核心 | `src/proxy.rs` | HTTP 转发 + HTTPS CONNECT 隧道 |
@@ -103,9 +104,11 @@
 
 ### 3.4 DNS 缓存
 - 数据结构：`DashMap<String, CacheEntry>`，分片锁并发读写。
-- TTL 60s（可配置）；惰性过期 + 软容量上限。
+- 缓存按域名保存 **IP 列表**（不含端口），HTTP 与 CONNECT 共用同一份缓存；
+  同一域名的 80/443 等端口共享解析结果。
+- TTL 60s（可配置）；惰性过期 + 软容量上限（优先清过期，其次随机驱逐）。
 - 命中/未命中分别打点到 `proxy_dns_cache_hits_total` /
-  `proxy_dns_cache_misses_total`。
+  `proxy_dns_cache_misses_total`；当前条目数暴露为 `proxy_dns_cache_entries`。
 
 ### 3.5 Metrics
 - 全量使用 `prometheus` crate；统一通过 `Registry::gather` 输出
@@ -143,6 +146,21 @@
 - mpsc 通道有界，`try_send` 失败即丢弃，杜绝日志背压拖垮主路径。
 - 错误以 `thiserror` 枚举分类后映射到 metrics 标签与 HTTP 状态码。
 
+### 3.9 目标地址安全策略（SSRF / 钓鱼域名）
+- 正向代理是天然的 SSRF 放大器，因此把"目标可达性"作为安全边界：
+  - 默认拒绝解析到私网、回环、链路本地（含 `169.254.169.254` 云元数据）、
+    组播、CGNAT、文档/保留地址的目标；同时检查 IPv4-mapped、6to4、NAT64
+    等 IPv6 内嵌 IPv4 场景。
+  - `allowed_ports` 默认只放行 80/443，降低借代理做端口探测的风险。
+  - `domain_allowlist` / `domain_blocklist` 支持精确域名与 `*.example.com`
+    通配，可在网关侧拦截已知钓鱼/恶意域名。
+- **防 DNS rebinding**：普通 HTTP 路径通过 `SafeResolver` 把 `DnsCache` 与
+  安全策略接入 `hyper_util::HttpConnector`，在真正建连前基于解析结果过滤；
+  CONNECT 路径在解析后同样二次过滤。全部地址被拒绝时返回 403。
+- host 维度指标基数由 `[metrics] max_host_labels` 限制；达到上限后新 host
+  折叠为 `other`，避免攻击者用海量随机域名制造 Prometheus label 内存膨胀。
+- 被拦截目标通过 `proxy_security_blocked_total{reason}` 观测。
+
 ---
 
 ## 4. 启动与配置
@@ -163,6 +181,9 @@ RUST_LOG=info ./target/release/rust-http-proxy
 | `OO_ENABLED` | 是否启用 OpenObserve 上报 |
 | `OO_ENDPOINT` / `OO_ORG` / `OO_STREAM` | OpenObserve 目标 |
 | `OO_USERNAME` / `OO_PASSWORD` | Basic Auth 凭证 |
+| `PROXY_CONFIG` | 配置文件路径（默认 `config.toml`） |
+
+`[security]` 与 `[metrics] max_host_labels` 的说明见 `config.toml` 注释。
 
 ---
 

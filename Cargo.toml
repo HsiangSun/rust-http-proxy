@@ -22,8 +22,13 @@ socket2 = { version = "0.5", features = ["all"] }
 dashmap = "6.1"
 
 # Metrics
-prometheus = { version = "0.13", features = ["process"] }
+# 不使用 prometheus 的 process collector：它依赖 Linux 专属的 procfs，
+# 在 FreeBSD 上无法编译。进程 CPU/内存由下方 sysinfo 采样器提供。
+prometheus = "0.13"
 sysinfo = "0.32"
+
+# hyper-util 的自定义 DNS resolver 接口基于 tower Service
+tower-service = "0.3"
 
 # HTTP client for OpenObserve uploads
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip"] }
