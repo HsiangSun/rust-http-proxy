@@ -10,7 +10,8 @@
 #   1. 创建系统用户 rust-proxy
 #   2. 安装二进制/配置到 /usr/local/rust-http-proxy
 #   3. 安装 rc.d 服务到 /usr/local/etc/rc.d/rust-http-proxy
-#   4. 在 /etc/rc.conf 中启用并启动服务
+#   4. 自动配置独立日志、中文显示、日志轮转与定时检查
+#   5. 在 /etc/rc.conf 中启用并启动服务
 #
 set -eu
 
@@ -35,6 +36,7 @@ BIN_SRC=""
 for c in "${BIN:-}" \
          "${SCRIPT_DIR}/rust-http-proxy" \
          "${SCRIPT_DIR}/../../rust-http-proxy" \
+         "${SCRIPT_DIR}/../../target/release/rust-http-proxy" \
          "${SCRIPT_DIR}/../../../rust-http-proxy"; do
     if [ -n "$c" ] && [ -f "$c" ]; then
         BIN_SRC="$c"
@@ -57,6 +59,10 @@ for c in "${CFG:-}" \
         break
     fi
 done
+
+# ── 配置日志 ──────────────────────────────────────────────────────────────
+# 在停止现有代理前完成日志配置，避免配置失败时中断现有服务。
+sh "${SCRIPT_DIR}/setup-logging.sh"
 
 # ── 创建用户/组 ───────────────────────────────────────────────────────────
 if ! pw groupshow "$APP_GROUP" >/dev/null 2>&1; then

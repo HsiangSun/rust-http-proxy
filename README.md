@@ -122,8 +122,9 @@ FreeBSD 15.1+，x86_64 FreeBSD 可直接按下面步骤在目标机上构建。
 pkg install rust
 cargo build --release
 
-# 安装为 rc.d 服务（二进制与 config.toml 放在 release 包根目录）
-sudo sh deploy/freebsd/install.sh
+# 以 root 安装为 rc.d 服务，自动识别 target/release 下的二进制。
+# release 包也使用同一安装命令。
+sh deploy/freebsd/install.sh
 ```
 
 服务管理：
@@ -140,24 +141,17 @@ tail -F /var/log/rust-http-proxy.log
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
 `rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
 
-服务通过 `NO_COLOR=1` 禁用日志颜色控制码。独立日志与轮转配置安装方式：
+FreeBSD 安装脚本会自动配置独立日志、日志轮转和定时检查，并通过 `NO_COLOR=1`
+禁用颜色控制码、通过 syslogd 的 `-8` 参数保留中文 UTF-8 字节。
+日志集中写入 `/var/log/rust-http-proxy.log`，不再重复写入 messages/daemon.log。
+已有应用配置和日志内容会保留；调整前的日志配置备份到 `/var/backups/`。
+重复执行安装脚本不会重复添加日志路由或定时任务。
+
+已安装服务只需单独更新日志设置时，也可以以 root 执行：
 
 ```sh
-install -d -m 0755 /usr/local/etc/syslog.d /usr/local/etc/newsyslog.conf.d
-touch /var/log/rust-http-proxy.log
-chmod 0640 /var/log/rust-http-proxy.log
-install -m 0644 deploy/freebsd/syslog-rust-http-proxy.conf /usr/local/etc/syslog.d/rust-http-proxy.conf
-install -m 0644 deploy/freebsd/newsyslog-rust-http-proxy.conf /usr/local/etc/newsyslog.conf.d/rust-http-proxy.conf
-install -m 0644 deploy/freebsd/cron-rust-http-proxy-logs /etc/cron.d/rust-http-proxy-logs
+sh deploy/freebsd/setup-logging.sh
 ```
-
-在 `/etc/syslog.conf` 的通用规则前加 `!-rust-http-proxy`；原有的 `!-devd`
-改成 `!-devd,rust-http-proxy`，保留 include 前的 `!*` 重置行。
-这将代理日志集中到独立文件，避免重复写入 messages/daemon.log。
-然后执行 `service syslogd reload` 和 `service rust-http-proxy restart`。
-如果中文日志被显示为 `M-...`，在现有 `syslogd_flags` 中追加 `-8` 并执行
-`service syslogd restart`，让 syslogd 保留 UTF-8 字节。
-未安装独立日志配置时，默认仍可在 `/var/log/messages`、`/var/log/daemon.log` 查看。
 
 代理日志每天午夜或达到 5 MiB 时轮转，保留 5 份 gzip 压缩备份，不保证固定天数。
 cron 每 5 分钟检查一次；高流量时文件可能在两次检查之间超过阈值，因此这不是硬容量限制。

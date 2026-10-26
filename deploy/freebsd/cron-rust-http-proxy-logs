@@ -1,3 +1,4 @@
 # 安装到 /etc/cron.d/rust-http-proxy-logs，root:wheel，0644。
 # 每 5 分钟检查这两个日志，避开系统整点的全局 newsyslog 任务。
-1-59/5 * * * * root /usr/sbin/newsyslog /var/log/rust-http-proxy.log /var/log/pflog
+1-59/5 * * * * root /usr/sbin/newsyslog /var/log/rust-http-proxy.log
+1-59/5 * * * * root test ! -f /var/log/pflog || /usr/sbin/newsyslog /var/log/pflog
