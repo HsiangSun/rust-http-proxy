@@ -122,21 +122,72 @@ FreeBSD 15.1+，x86_64 FreeBSD 可直接按下面步骤在目标机上构建。
 pkg install rust
 cargo build --release
 
-# 安装为 rc.d 服务（二进制与 config.toml 放在 release 包根目录）
-sudo sh deploy/freebsd/install.sh
+# 以 root 安装为 rc.d 服务，自动识别 target/release 下的二进制。
+# release 包也使用同一安装命令。
+sh deploy/freebsd/install.sh
 ```
 
 服务管理：
 
 ```bash
-service rust_http_proxy status
-service rust_http_proxy restart
-tail -f /var/log/messages | grep rust-http-proxy
+service rust-http-proxy status
+service rust-http-proxy stop
+service rust-http-proxy start
+service rust-http-proxy restart
+tail -F /var/log/rust-http-proxy.log
 ```
 
 内核调优参考 `deploy/freebsd/sysctl.conf.sample`（默认不自动修改系统配置）。
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
-`rust_http_proxy_config` 指定配置文件。
+`rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
+
+FreeBSD 安装脚本会自动配置独立日志、日志轮转和定时检查，并通过 `NO_COLOR=1`
+禁用颜色控制码、通过 syslogd 的 `-8` 参数保留中文 UTF-8 字节。
+日志集中写入 `/var/log/rust-http-proxy.log`，不再重复写入 messages/daemon.log。
+已有应用配置和日志内容会保留；调整前的日志配置备份到 `/var/backups/`。
+重复执行安装脚本不会重复添加日志路由或定时任务。
+
+已安装服务只需单独更新日志设置时，也可以以 root 执行：
+
+```sh
+sh deploy/freebsd/setup-logging.sh
+```
+
+代理日志每天午夜或达到 5 MiB 时轮转，保留 5 份 gzip 压缩备份，不保证固定天数。
+cron 每 5 分钟检查一次；高流量时文件可能在两次检查之间超过阈值，因此这不是硬容量限制。
+防火墙日志继续使用 `/etc/newsyslog.conf.d/pf.conf` 的大小与备份数量设置。
+
+镜像部署时，可统一使用 `server.listen = "0.0.0.0:8080"` 和
+`metrics.listen = "0.0.0.0:9090"`，通过 PF 将这两个端口限制为 VPC 内访问。
+`deploy/freebsd/pf.conf.sample` 默认允许来源 `10.3.0.0/16`，保留本机回环访问，
+拒绝其他 IPv4 来源以及 IPv6 对这两个端口的访问；其他端口和出站流量继续放行。
+该配置不包含固定的本机 IP 或网卡名称，可以随镜像复制。
+
+以下命令适用于尚未配置 PF 的主机；已有防火墙时应将端口限制合并到原规则中，
+不能用示例覆盖原有的访问限制。以 root 执行：
+
+```sh
+kldload -n pf
+pfctl -nf deploy/freebsd/pf.conf.sample
+install -m 0600 deploy/freebsd/pf.conf.sample /etc/pf.conf
+sysrc pf_enable=YES pf_rules=/etc/pf.conf pflog_enable=YES
+service pflog start
+service pf start
+service rust-http-proxy restart
+```
+
+规则中的 `log` 记录被阻断的访问。实时查看：
+
+```sh
+tcpdump -nn -e -tttt -i pflog0
+```
+
+历史日志使用 `tcpdump -nn -e -tttt -r /var/log/pflog` 读取。
+如果提示 `pflog0: No such device exists`，先执行 `service pflog start`；
+服务会加载 `pflog` 模块并自动创建接口。
+
+制作镜像前确认 `pf_enable="YES"`、`pflog_enable="YES"` 与 `rust_http_proxy_enable="YES"`。
+如果新机器位于不同 VPC，应修改 PF 中的 `vpc_net` 并执行 `service pf reload`。
 
 ## 文档
 
