@@ -112,8 +112,13 @@ domain_blocklist = []             # 统一拦截已知恶意/钓鱼域名，支�
 
 代码与依赖已兼容 FreeBSD（移除了 Linux 专属的 procfs process collector）。
 
+打 `v*` tag 时 GitHub Actions 会在 FreeBSD 15.1 **aarch64** VM 中额外构建
+`rust-http-proxy-<tag>-aarch64-unknown-freebsd.tar.gz`，与 Linux 包一起发布。
+aarch64 通过 QEMU 模拟编译，CI 中使用 thin LTO 以控制构建时间；该包面向
+FreeBSD 15.1+，x86_64 FreeBSD 可直接按下面步骤在目标机上构建。
+
 ```bash
-# 在 FreeBSD 上构建
+# 也可以直接在 FreeBSD 上构建
 pkg install rust
 cargo build --release
 
@@ -139,3 +144,4 @@ tail -f /var/log/messages | grep rust-http-proxy
 - [指标手册](docs/METRICS.md)
 - [可观测：VictoriaMetrics 抓取 + Grafana Dashboard](docs/OBSERVABILITY.md)
 - [Grafana Dashboard JSON](docs/grafana-dashboard.json)
+- [压测工具](deploy/bench/README.md)
