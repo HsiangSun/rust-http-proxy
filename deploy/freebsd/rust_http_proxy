@@ -58,6 +58,7 @@ command_args="-f -p \"${pidfile}\" -u \"${_rust_http_proxy_user}\" -S -T rust-ht
     /usr/bin/env \
     PROXY_CONFIG=\"${rust_http_proxy_config}\" \
     RUST_LOG=\"${rust_http_proxy_log_level}\" \
+    NO_COLOR=1 \
     \"${procname}\""
 
 required_dirs="/usr/local/rust-http-proxy"

@@ -118,7 +118,11 @@ echo
 echo "===== 安装完成 ====="
 service "$RC_NAME" status || true
 echo
-echo "查看日志： tail -f /var/log/messages | grep rust-http-proxy"
+if [ -f /usr/local/etc/syslog.d/rust-http-proxy.conf ]; then
+    echo "查看日志： tail -F /var/log/rust-http-proxy.log"
+else
+    echo "查看日志： tail -F /var/log/messages | grep --line-buffered rust-http-proxy"
+fi
 echo "重启服务： service $RC_NAME restart"
 echo "停止服务： service $RC_NAME stop"
 echo

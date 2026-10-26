@@ -133,12 +133,35 @@ service rust-http-proxy status
 service rust-http-proxy stop
 service rust-http-proxy start
 service rust-http-proxy restart
-tail -f /var/log/messages | grep rust-http-proxy
+tail -F /var/log/rust-http-proxy.log
 ```
 
 内核调优参考 `deploy/freebsd/sysctl.conf.sample`（默认不自动修改系统配置）。
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
 `rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
+
+服务通过 `NO_COLOR=1` 禁用日志颜色控制码。独立日志与轮转配置安装方式：
+
+```sh
+install -d -m 0755 /usr/local/etc/syslog.d /usr/local/etc/newsyslog.conf.d
+touch /var/log/rust-http-proxy.log
+chmod 0640 /var/log/rust-http-proxy.log
+install -m 0644 deploy/freebsd/syslog-rust-http-proxy.conf /usr/local/etc/syslog.d/rust-http-proxy.conf
+install -m 0644 deploy/freebsd/newsyslog-rust-http-proxy.conf /usr/local/etc/newsyslog.conf.d/rust-http-proxy.conf
+install -m 0644 deploy/freebsd/cron-rust-http-proxy-logs /etc/cron.d/rust-http-proxy-logs
+```
+
+在 `/etc/syslog.conf` 的通用规则前加 `!-rust-http-proxy`；原有的 `!-devd`
+改成 `!-devd,rust-http-proxy`，保留 include 前的 `!*` 重置行。
+这将代理日志集中到独立文件，避免重复写入 messages/daemon.log。
+然后执行 `service syslogd reload` 和 `service rust-http-proxy restart`。
+如果中文日志被显示为 `M-...`，在现有 `syslogd_flags` 中追加 `-8` 并执行
+`service syslogd restart`，让 syslogd 保留 UTF-8 字节。
+未安装独立日志配置时，默认仍可在 `/var/log/messages`、`/var/log/daemon.log` 查看。
+
+代理日志每天午夜或达到 5 MiB 时轮转，保留 5 份 gzip 压缩备份，不保证固定天数。
+cron 每 5 分钟检查一次；高流量时文件可能在两次检查之间超过阈值，因此这不是硬容量限制。
+防火墙日志继续使用 `/etc/newsyslog.conf.d/pf.conf` 的大小与备份数量设置。
 
 镜像部署时，可统一使用 `server.listen = "0.0.0.0:8080"` 和
 `metrics.listen = "0.0.0.0:9090"`，通过 PF 将这两个端口限制为 VPC 内访问。
