@@ -74,6 +74,7 @@ jobs:
 
           # 文档：有就带，没有也不致命
           [ -f README.md ] && cp README.md "dist/${STAGE}/" || true
+          [ -f LICENSE ]   && cp LICENSE   "dist/${STAGE}/" || true
           [ -d docs ]      && cp -r docs   "dist/${STAGE}/" || true
 
           tar -czf "${PKG_NAME}" -C dist "${STAGE}"
@@ -145,6 +146,7 @@ jobs:
                      "dist/${STAGE}/deploy/freebsd/rust_http_proxy" \
                      "dist/${STAGE}/deploy/bench/proxy_bench.py"
             [ -f README.md ] && cp README.md "dist/${STAGE}/" || true
+            [ -f LICENSE ] && cp LICENSE "dist/${STAGE}/" || true
             [ -d docs ] && cp -r docs "dist/${STAGE}/" || true
 
             tar -czf "${PKG_NAME}" -C dist "${STAGE}"

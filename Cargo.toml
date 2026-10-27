@@ -3,7 +3,7 @@ name = "rust-http-proxy"
 version = "0.1.0"
 edition = "2021"
 description = "High-performance HTTP/HTTPS forward proxy with metrics and OpenObserve logging"
-license = "MIT"
+license = "BSD-3-Clause"
 
 [dependencies]
 # Async runtime

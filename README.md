@@ -196,3 +196,7 @@ tcpdump -nn -e -tttt -i pflog0
 - [可观测：VictoriaMetrics 抓取 + Grafana Dashboard](docs/OBSERVABILITY.md)
 - [Grafana Dashboard JSON](docs/grafana-dashboard.json)
 - [压测工具](deploy/bench/README.md)
+
+## License
+
+[BSD 3-Clause](LICENSE)
