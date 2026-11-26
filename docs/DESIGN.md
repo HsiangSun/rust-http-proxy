@@ -147,16 +147,37 @@
 - 错误以 `thiserror` 枚举分类后映射到 metrics 标签与 HTTP 状态码。
 
 ### 3.9 目标地址安全策略（SSRF / 钓鱼域名）
-- 正向代理是天然的 SSRF 放大器，因此把"目标可达性"作为安全边界：
-  - 默认拒绝解析到私网、回环、链路本地（含 `169.254.169.254` 云元数据）、
-    组播、CGNAT、文档/保留地址的目标；同时检查 IPv4-mapped、6to4、NAT64
-    等 IPv6 内嵌 IPv4 场景。
-  - `allowed_ports` 默认只放行 80/443，降低借代理做端口探测的风险。
-  - `domain_allowlist` / `domain_blocklist` 支持精确域名与 `*.example.com`
-    通配，可在网关侧拦截已知钓鱼/恶意域名。
-- **防 DNS rebinding**：普通 HTTP 路径通过 `SafeResolver` 把 `DnsCache` 与
-  安全策略接入 `hyper_util::HttpConnector`，在真正建连前基于解析结果过滤；
-  CONNECT 路径在解析后同样二次过滤。全部地址被拒绝时返回 403。
+正向代理是天然的 SSRF 放大器，因此把"目标可达性"作为安全边界，设计参考 OWASP
+*Server-Side Request Forgery Prevention Cheat Sheet*。代理的目标是任意外部域名/IP，
+对应其中的 "Case 2"（拒绝列表 + 建连时强制校验）；配置 `domain_allowlist` 后收紧为
+"Case 1"（白名单）。
+
+| OWASP 建议 | 实现 |
+|-----------|------|
+| 只允许 HTTP/HTTPS | 普通转发只接受 `http` 绝对 URI；`https://`、`ftp://`、`gopher://`、`file://` 等返回 403（`reason=scheme`）。HTTPS 走 CONNECT |
+| 用库校验 IP，防 Hex/Octal/Dword/Mixed 编码绕过 | `std::net::IpAddr` 只接受标准写法；最后一段是数字的主机名（WHATWG "ends in a number"）一律拒绝（`ip_encoding`），否则 getaddrinfo 会把 `0x7f.1` 解析成 127.0.0.1 |
+| 比对拒绝列表前先规范化 | IPv4-mapped、NAT64 `64:ff9b::/96` 先还原为内嵌 IPv4；配置规则与客户端输入走同一个 `normalize_host` |
+| 最小拒绝列表（IMDS、回环、RFC1918、链路本地、ULA、组播、NAT64…） | IPv4 按 IANA 特殊用途地址表全部拒绝；IPv6 只放行 `2000::/3` 全球单播，再排除其中的 Teredo/6to4/文档段；云元数据地址单独成表，`block_private_ips=false` 时仍拒绝（`metadata_ip`） |
+| 防 DNS rebinding：只连接校验过的地址，校验与建连之间不能有未校验的解析 | HTTP：`SafeResolver` 接入 `HttpConnector`，连接池建连前对实际使用的地址校验；CONNECT：直接连接校验后的地址。解析结果中任一地址受限即拒绝整个目标 |
+| 重试与回退连接同样校验 | Happy Eyeballs 回退与连接池重试都只从 `SafeResolver` 校验后的地址里选 |
+| 禁止跟随重定向 | 代理不跟随上游 3xx（原样返回，客户端的下一跳请求重新校验）；OpenObserve 上报客户端设置 `redirect::Policy::none()` |
+| 解析器读法不一致时直接拒绝 | 拒绝 userinfo（`trusted.com@evil.com`，RFC 9110 §4.2.4）与重复 Host 头；绝对 URI 优先并覆盖 Host 头 |
+| 维护内部域名列表，避免把内部名发给外部 DNS | 解析前拒绝单标签主机名与 `.internal`/`.local`/`.localhost`/`.home.arpa` 等内部后缀（`internal_domain`）；公司自有内网域名加入 `domain_blocklist` |
+| 网络层隔离 | systemd `IPAddressDeny=` 丢弃与元数据端点之间的报文；FreeBSD 提供按用户限制出站的 PF 规则示例；入站由 PF / 安全组限制为 VPC |
+
+补充说明：
+- 拦截响应只返回 `reason=<标签>`，不回显解析出的地址，避免代理沦为内网 DNS 探测器；
+  完整原因（含地址）写入 `warn!` 日志与 `proxy.blocked` 访问日志事件。
+- 预检查之后 DNS 结果发生变化时，`SafeResolver` 在建连阶段拒绝；错误经
+  `find_security_error` 从 hyper-util 错误链中还原，仍按 403 与
+  `proxy_security_blocked_total` 统计，而不是记成上游 502。
+- `blocked_cidrs` 用于补充"公网地址但信任本代理出口 IP"的目标；网段或域名规则写错时
+  启动失败，避免以为已拦截的目标实际可达。
+- 不通过给目标名追加根点（`example.com.`）来绕开 resolv.conf 的 search 域：实测 glibc
+  会因此跳过 `/etc/hosts`，破坏 hosts 覆盖与基于 hosts 的拦截。单标签主机名已在解析前
+  被拒绝，经 search 域补全出的内网名字仍会被地址校验拦下。
+- `allowed_ports` 默认只放行 80/443，降低借代理做端口探测的风险；`domain_allowlist` /
+  `domain_blocklist` 支持精确域名与 `*.example.com` 通配，可在网关侧拦截已知钓鱼/恶意域名。
 - host 维度指标基数由 `[metrics] max_host_labels` 限制；达到上限后新 host
   折叠为 `other`，避免攻击者用海量随机域名制造 Prometheus label 内存膨胀。
 - 被拦截目标通过 `proxy_security_blocked_total{reason}` 观测。

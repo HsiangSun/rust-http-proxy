@@ -50,7 +50,8 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cfg.dns.timeout_secs),
         metrics.clone(),
     ));
-    let security = Arc::new(security::SecurityPolicy::from_config(&cfg.security));
+    // 安全规则写错时直接退出，避免以为已拦截的目标实际仍可访问。
+    let security = Arc::new(security::SecurityPolicy::from_config(&cfg.security)?);
     let log_sink = logger::spawn(cfg.openobserve.clone());
 
     // 启动 metrics HTTP 服务。

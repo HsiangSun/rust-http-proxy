@@ -59,6 +59,13 @@ RestrictSUIDSGID=true
 LockPersonality=true
 # 只允许 IPv4/IPv6 + AF_UNIX；屏蔽其他协议族减少内核攻击面。
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 网络层 SSRF 纵深防御（OWASP：应用层与网络层同时设防）：即使应用层目标校验被
+# 绕过，内核（cgroup BPF）也会丢弃本服务与云元数据端点之间的报文——
+# AWS/GCP/Azure/OCI IMDS 169.254.169.254、ECS 任务元数据 169.254.170.2、
+# EKS Pod Identity 169.254.170.23 及对应 IPv6。只列具体地址而不是整个
+# 169.254.0.0/16，避免误伤经 169.254.169.253 访问的 Amazon DNS。
+# 内核不支持 BPF 防火墙时 systemd 只打印告警，服务照常启动。
+IPAddressDeny=169.254.169.254 169.254.170.2 169.254.170.23 fd00:ec2::254 fd00:ec2::23
 # 屏蔽访问 /sys/fs/cgroup 之类的旁路。
 ProtectClock=true
 ProtectHostname=true

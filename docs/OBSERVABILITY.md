@@ -232,7 +232,8 @@ journalctl -u rust-http-proxy -f | head -5
 ### 3.3 验证 OpenObserve 收到日志
 
 OpenObserve UI → Logs → Stream 选 `proxy_logs` → 时间窗 last 5 min →
-应能看到代理的 `proxy.request` / `proxy.connect` 事件，过滤条件加：
+应能看到代理的 `proxy.request` / `proxy.connect` 事件；被安全策略拦截的请求记为
+`proxy.blocked`（level=WARN，含 `client`、`host`、`reason`、`error`）。过滤条件加：
 
 ```
 proxy_group='sevenpay-proxy'

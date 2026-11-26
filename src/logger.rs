@@ -108,6 +108,9 @@ async fn run_forwarder(cfg: OpenObserveConfig, mut rx: mpsc::Receiver<LogEntry>)
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .pool_idle_timeout(Duration::from_secs(60))
+        // 不跟随重定向（OWASP SSRF：重定向会绕过对目标地址的校验）。上报地址
+        // 由运维配置，返回 3xx 时应修正配置，而不是把日志批量转发到别处。
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,

@@ -93,20 +93,41 @@ sudo systemctl stop rust-http-proxy
 
 ## 安全加固
 
-`config.toml` 的 `[security]` 段控制目标地址策略，默认配置已经开启基础防护：
+目标地址策略参考 [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)，
+由 `config.toml` 的 `[security]` 段控制，默认配置即开启全部防护：
 
 ```toml
 [security]
-block_private_ips = true          # 拒绝 127.0.0.1 / 10.x / 169.254.169.254 / ULA 等
+block_private_ips = true          # 拒绝私网/回环/CGNAT/保留等非全球可路由地址
 block_ip_literals = false         # 是否连公网 IP 字面量也拒绝
+block_internal_domains = true     # 拒绝 localhost/metadata 等单标签名与 .internal/.local 等内部后缀
 allowed_ports = [80, 443]         # 目标端口白名单，空数组表示不限制
 domain_allowlist = []             # 非空时只放行匹配域名，支持 *.example.com
 domain_blocklist = []             # 统一拦截已知恶意/钓鱼域名，支持 *.example.com
+blocked_cidrs = []                # 额外拒绝网段，例如按来源 IP 信任本代理出口的公网服务
 ```
 
-- 校验同时覆盖普通 HTTP 与 HTTPS CONNECT。
-- DNS 解析完成后会再次过滤地址，防止 DNS rebinding 把公网域名切换为内网 IP。
+| 防护 | 行为 |
+|------|------|
+| 云元数据 | `169.254.0.0/16`、`fe80::/10`、`fd00:ec2::/32` 等 IMDS 地址**始终拒绝**，关闭 `block_private_ips` 也不例外 |
+| 地址规范化 | `::ffff:169.254.169.254`、NAT64 `64:ff9b::a9fe:a9fe` 先还原为内嵌 IPv4 再判断；IPv6 只放行 `2000::/3` 全球单播 |
+| IP 编码绕过 | `0x7f.1`、`2130706433`、`0177.0.0.1`、`127.1` 等会被 getaddrinfo 当作 IP 的写法直接拒绝 |
+| DNS rebinding | 解析结果中任一地址受限即拒绝整个目标；只连接校验过的地址，连接池建连前对实际使用的地址再校验 |
+| 请求形态 | 普通转发只接受 `http://`（HTTPS 走 CONNECT）；拒绝 `user@host` 形式的 userinfo 与重复 Host 头 |
+| 内部域名 | 拒绝单标签主机名（会被 resolv.conf 的 search 域补全）与 `.internal`/`.local`/`.localhost`/`.home.arpa` 等后缀 |
+| 信息泄露 | 403 只返回 `reason=<标签>`，不回显解析出的内网地址；完整原因写入服务端日志 |
+| 配置校验 | 写错的网段/域名规则会导致启动失败，不会被静默忽略 |
+
+- 校验同时覆盖普通 HTTP 与 HTTPS CONNECT；代理不跟随上游重定向（3xx 原样返回，客户端的下一跳请求会重新校验）。
+- 每次拦截计入 `proxy_security_blocked_total{reason}`，并发出 `proxy.blocked` 访问日志事件（含 client、host、完整原因），可在 OpenObserve 中按来源追查。
 - `[metrics] max_host_labels` 限制 host 维度指标基数；随机域名/不存在的域名会被折叠为 `other`。
+
+网络层纵深防御（OWASP 建议应用层与网络层同时设防）：
+
+- systemd unit 通过 `IPAddressDeny=` 在内核层丢弃本服务与 IMDS / ECS / EKS Pod Identity 元数据端点之间的报文。
+- FreeBSD 可启用 `deploy/freebsd/pf.conf.sample` 中注释掉的 `user "rust-proxy"` 出站规则。
+- EC2 建议开启 IMDSv2（`HttpTokens=required`）并把 `HttpPutResponseHopLimit` 设为 1。注意正向代理可以替客户端发送
+  PUT 与任意请求头，IMDSv2 本身挡不住经代理发起的请求，应用层与网络层拦截才是关键。
 
 ## FreeBSD
 

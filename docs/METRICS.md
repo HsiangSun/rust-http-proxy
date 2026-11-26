@@ -27,8 +27,28 @@
 ## 2.1 安全指标
 | 指标名 | 类型 | 维度 | 说明 |
 |--------|------|------|------|
-| `proxy_security_blocked_total` | counter | `reason`={invalid_host,port,not_allowlisted,blocklisted,ip_literal,private_ip,no_public_ip} | 被目标安全策略拦截的请求数 |
+| `proxy_security_blocked_total` | counter | `reason`，取值见下表 | 被目标安全策略拦截的请求数 |
 | `proxy_metrics_host_label_overflow_total` | counter | — | host 维度标签达到上限后折叠为 `other` 的次数 |
+
+`proxy_security_blocked_total` 的 `reason` 取值（与 403 响应体中的 `reason=` 一致）：
+
+| reason | 含义 |
+|--------|------|
+| `scheme` | 普通转发使用了 `http` 以外的协议（`https://` 绝对 URI、`ftp://`、`gopher://` 等）|
+| `userinfo` | 目标 authority 或 Host 头携带 `user@` |
+| `invalid_host` | 主机名格式非法，或出现多个 Host 头 |
+| `ip_encoding` | 十六进制/八进制/整数/省略段等非标准 IP 写法（如 `0x7f.1`、`2130706433`）|
+| `port` | 目标端口不在 `allowed_ports` |
+| `internal_domain` | 单标签主机名或 `.internal`/`.local`/`.localhost` 等内部后缀 |
+| `ip_literal` | `block_ip_literals=true` 时直接使用 IP |
+| `not_allowlisted` / `blocklisted` | 不在域名白名单 / 命中域名黑名单 |
+| `metadata_ip` | 云元数据或链路本地地址（始终拒绝），**建议单独告警** |
+| `blocked_cidr` | 命中 `blocked_cidrs` |
+| `private_ip` | 私网/回环/保留等非全球可路由地址（IP 字面量或 DNS 解析结果）|
+| `no_public_ip` | DNS 没有返回任何可用地址 |
+
+告警示例：`increase(proxy_security_blocked_total{reason="metadata_ip"}[5m]) > 0`。
+对应的 `proxy.blocked` 访问日志事件带有 `client` / `host` / `reason` / `error`，用于反查来源。
 
 ## 3. SOCKS 命名空间（保留扩展位）
 | 指标名 | 类型 | 维度 | 说明 |

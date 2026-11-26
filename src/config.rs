@@ -132,26 +132,35 @@ impl Default for UpstreamConfig {
     }
 }
 
-/// 访问目标安全策略。
+/// 访问目标安全策略（参考 OWASP SSRF Prevention Cheat Sheet）。
 ///
 /// 正向代理天然是一个 SSRF 放大器：如果允许客户端任意指定目标，攻击者就能
 /// 借代理访问内网、云元数据地址（169.254.169.254）、本机管理端口等。
-/// 这里提供三层防护：
+/// 这里提供以下防护：
 ///
-/// 1. 禁止解析结果落入私网 / 保留地址（默认开启）；
-/// 2. 目标端口白名单（默认只允许 80/443）；
-/// 3. 可选域名白名单 / 黑名单（支持 `*.example.com` 通配）。
+/// 1. 禁止目标落入私网 / 保留地址（默认开启）；云元数据与链路本地地址始终拒绝；
+/// 2. 额外拒绝网段 `blocked_cidrs`（始终生效）；
+/// 3. 拒绝单标签主机名与 `.internal` / `.local` 等内部域名（默认开启）；
+/// 4. 目标端口白名单（默认只允许 80/443）；
+/// 5. 可选域名白名单 / 黑名单（支持 `*.example.com` 通配）。
 ///
-/// 所有校验同时作用于普通 HTTP 转发与 HTTPS CONNECT 隧道；并且在 DNS
-/// 解析完成后再次过滤地址，以抵御 DNS rebinding。
+/// 所有校验同时作用于普通 HTTP 转发与 HTTPS CONNECT 隧道；DNS 解析结果中
+/// 任一地址被拒绝即拒绝整个目标，且只连接校验过的地址，以抵御 DNS rebinding。
+/// 规则写错（无法解析的网段 / 域名）会导致启动失败，而不是被静默忽略。
 #[derive(Debug, Clone, Deserialize)]
 pub struct SecurityConfig {
-    /// 是否禁止访问私网 / 回环 / 链路本地 / 组播 / 保留地址。
+    /// 是否禁止访问私网 / 回环 / CGNAT / 组播 / 保留等非全球可路由地址。
+    /// 关闭后云元数据与链路本地地址仍然被拒绝。
     #[serde(default = "default_true")]
     pub block_private_ips: bool,
     /// 是否禁止客户端直接使用 IP 字面量作为目标。
     #[serde(default)]
     pub block_ip_literals: bool,
+    /// 是否拒绝内部主机名：单标签主机名（`localhost`、`metadata`、`kubernetes`
+    /// 等会被 resolv.conf 的 search 域补全成内网名字），以及 `.internal`、
+    /// `.local`、`.localhost`、`.home.arpa` 等内部 / 特殊用途后缀。
+    #[serde(default = "default_true")]
+    pub block_internal_domains: bool,
     /// 允许的目标端口；为空表示不限制。默认仅 80/443。
     #[serde(default = "default_allowed_ports")]
     pub allowed_ports: Vec<u16>,
@@ -161,6 +170,11 @@ pub struct SecurityConfig {
     /// 域名黑名单；匹配的目标一律拒绝。
     #[serde(default)]
     pub domain_blocklist: Vec<String>,
+    /// 额外拒绝的目标网段（CIDR 或单个地址），无论 `block_private_ips`
+    /// 如何配置都生效。适合补充"公网地址但信任本代理出口 IP"的服务，
+    /// 例如公司办公网 / 其他 VPC 的 NAT 出口、按来源 IP 放行的内部后台。
+    #[serde(default)]
+    pub blocked_cidrs: Vec<String>,
 }
 
 fn default_true() -> bool {
@@ -176,9 +190,11 @@ impl Default for SecurityConfig {
         Self {
             block_private_ips: true,
             block_ip_literals: false,
+            block_internal_domains: true,
             allowed_ports: default_allowed_ports(),
             domain_allowlist: Vec::new(),
             domain_blocklist: Vec::new(),
+            blocked_cidrs: Vec::new(),
         }
     }
 }

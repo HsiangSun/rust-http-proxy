@@ -27,7 +27,7 @@ use hyper::body::Incoming;
 use hyper::http::uri::Authority;
 use hyper::server::conn::http1 as server_http1;
 use hyper::service::service_fn;
-use hyper::{header, Method, Request, Response, StatusCode, Uri};
+use hyper::{header, HeaderMap, Method, Request, Response, StatusCode, Uri};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -40,7 +40,7 @@ use crate::config::UpstreamConfig;
 use crate::dns::DnsCache;
 use crate::logger::{LogEntry, LogSink};
 use crate::metrics::Metrics;
-use crate::security::{SafeResolver, SecurityError, SecurityPolicy};
+use crate::security::{self, SafeResolver, SecurityError, SecurityPolicy};
 
 /// 复用的 hyper HTTP/1 上游客户端类型别名。请求体使用 `Full<Bytes>`。
 pub type HttpClient = Client<HttpConnector<SafeResolver>, Full<Bytes>>;
@@ -166,7 +166,8 @@ enum ForwardError {
     MissingHost,
     #[error("DNS 解析失败: {0}")]
     Dns(String),
-    #[error("目标被安全策略拒绝: {0}")]
+    /// Display 即返回给客户端的文本：只含原因标签，不回显解析出的地址。
+    #[error("{}", .0.client_message())]
     Blocked(SecurityError),
     #[error("上游请求失败: {0}")]
     Upstream(String),
@@ -222,25 +223,40 @@ async fn forward_http(
     ctx: &Arc<ProxyContext>,
 ) -> Result<(Response<Full<Bytes>>, String, u16), (ForwardError, Option<String>)> {
     // 解析目标 host:port。代理收到的请求通常带绝对 URI；若没有，从 Host 头补齐。
-    let (raw_host, port) = extract_host_port(&req).map_err(|e| (e, None))?;
+    // 同时校验请求形态：协议白名单、userinfo、重复 Host 头。
+    let (raw_host, port) = match extract_host_port(req.uri(), req.headers()) {
+        Ok(v) => v,
+        Err(e) => {
+            if let ForwardError::Blocked(se) = &e {
+                // 不记录原始 authority：userinfo 里可能带着凭证。
+                record_security_block(ctx, peer, None, se, header_trace_id(req.headers()));
+                warn!(client = %peer, reason = se.reason(), error = %se, "HTTP 请求形态被安全策略拒绝");
+            }
+            return Err((e, None));
+        }
+    };
 
-    // 第一层校验：域名格式、端口白名单、IP 字面量、域名黑白名单。
+    // 第一层校验：域名格式、端口白名单、IP 字面量、内部域名、域名黑白名单。
     let host = match ctx.security.check_target(&raw_host, port) {
         Ok(host) => host,
         Err(e) => {
-            ctx.metrics
-                .security_blocked_total
-                .with_label_values(&[e.reason()])
-                .inc();
             let host_port = format_authority(&raw_host, port);
+            record_security_block(
+                ctx,
+                peer,
+                Some(&host_port),
+                &e,
+                header_trace_id(req.headers()),
+            );
             warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "HTTP 目标被安全策略拒绝");
             return Err((ForwardError::Blocked(e), Some(host_port)));
         }
     };
     let host_port = format_authority(&host, port);
 
-    // 预先解析并过滤地址：既能尽早给出 403、顺便预热 DNS 缓存，也让后续
-    // hyper 连接池在新建连接时拿到同一份经过安全过滤的地址。
+    // 预先解析并校验地址：既能尽早给出 403、顺便预热 DNS 缓存，也让后续
+    // hyper 连接池新建连接时命中同一份缓存。真正建连前 SafeResolver 会对
+    // 实际使用的地址再校验一次，因此这里与建连之间不存在未校验的解析。
     let addrs = match ctx.dns.lookup_host(&host, port).await {
         Ok(addrs) => addrs,
         Err(e) => {
@@ -248,11 +264,14 @@ async fn forward_http(
             return Err((ForwardError::Dns(e.to_string()), Some(host_port)));
         }
     };
-    if let Err(e) = ctx.security.filter_addrs(&host, addrs) {
-        ctx.metrics
-            .security_blocked_total
-            .with_label_values(&[e.reason()])
-            .inc();
+    if let Err(e) = ctx.security.check_resolved(&host, addrs) {
+        record_security_block(
+            ctx,
+            peer,
+            Some(&host_port),
+            &e,
+            header_trace_id(req.headers()),
+        );
         warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "HTTP 目标解析到受限地址");
         return Err((ForwardError::Blocked(e), Some(host_port)));
     }
@@ -276,21 +295,29 @@ async fn forward_http(
 
     // 发起请求，附整体超时。
     let connect_started = Instant::now();
-    let resp =
-        match tokio::time::timeout(ctx.io_timeout, ctx.http_client.request(upstream_req)).await {
-            Err(_) => {
-                warn!(client = %peer, host = %host_port, "HTTP 上游请求超时");
-                return Err((ForwardError::Timeout, Some(host_port)));
+    let resp = match tokio::time::timeout(ctx.io_timeout, ctx.http_client.request(upstream_req))
+        .await
+    {
+        Err(_) => {
+            warn!(client = %peer, host = %host_port, "HTTP 上游请求超时");
+            return Err((ForwardError::Timeout, Some(host_port)));
+        }
+        Ok(Err(e)) => {
+            // 预检查之后 DNS 结果发生了变化（缓存恰好过期且被 rebinding 到受限
+            // 地址）时，SafeResolver 会在建连前拒绝；还原出安全错误按 403 处理。
+            if let Some(se) = security::find_security_error(&e).cloned() {
+                record_security_block(ctx, peer, Some(&host_port), &se, trace_id.clone());
+                warn!(client = %peer, host = %host_port, reason = se.reason(), error = %se, "HTTP 目标在建连时被安全策略拒绝（DNS 结果已变化）");
+                return Err((ForwardError::Blocked(se), Some(host_port)));
             }
-            Ok(Err(e)) => {
-                // hyper_util legacy::Error 的 Display 通常会带 "client error (Connect)" 字样，
-                // 我们据此把 connect 失败单独归类，并打详细原因。
-                let s = format!("{e}");
-                warn!(client = %peer, host = %host_port, error = %s, "HTTP 上游请求失败");
-                return Err((ForwardError::Upstream(s), Some(host_port)));
-            }
-            Ok(Ok(r)) => r,
-        };
+            // hyper_util legacy::Error 的 Display 通常会带 "client error (Connect)" 字样，
+            // 我们据此把 connect 失败单独归类，并打详细原因。
+            let s = format!("{e}");
+            warn!(client = %peer, host = %host_port, error = %s, "HTTP 上游请求失败");
+            return Err((ForwardError::Upstream(s), Some(host_port)));
+        }
+        Ok(Ok(r)) => r,
+    };
     ctx.metrics
         .upstream_connect_duration
         .observe(connect_started.elapsed().as_secs_f64());
@@ -364,23 +391,37 @@ async fn handle_connect(
     // CONNECT 的 authority 按 RFC 应带端口；缺失时按 HTTPS 默认 443 处理。
     let port = authority.port_u16().unwrap_or(443);
 
-    // 第一层校验：域名格式、端口白名单、IP 字面量、域名黑白名单。
+    // 请求形态校验：userinfo 常被用来伪装真实目标（`trusted.com@evil.com`）。
+    // 日志与指标只使用 host 部分，避免记录 userinfo 中的凭证。
+    if let Err(e) = security::check_no_userinfo(authority.as_str()) {
+        let host_port = format_authority(&raw_host, port);
+        let trace_id = header_trace_id(req.headers());
+        return reject_connect(
+            &ctx,
+            peer,
+            &host_port,
+            started,
+            &e,
+            trace_id,
+            "CONNECT 请求形态被安全策略拒绝",
+        );
+    }
+
+    // 第一层校验：域名格式、端口白名单、IP 字面量、内部域名、域名黑白名单。
     let host = match ctx.security.check_target(&raw_host, port) {
         Ok(host) => host,
         Err(e) => {
-            ctx.metrics
-                .security_blocked_total
-                .with_label_values(&[e.reason()])
-                .inc();
-            ctx.metrics
-                .requests_failure
-                .with_label_values(&["blocked"])
-                .inc();
             let host_port = format_authority(&raw_host, port);
-            ctx.metrics
-                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
-            warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "CONNECT 目标被安全策略拒绝");
-            return build_error_response(StatusCode::FORBIDDEN, format!("目标被拒绝: {e}"));
+            let trace_id = header_trace_id(req.headers());
+            return reject_connect(
+                &ctx,
+                peer,
+                &host_port,
+                started,
+                &e,
+                trace_id,
+                "CONNECT 目标被安全策略拒绝",
+            );
         }
     };
     let host_port = format_authority(&host, port);
@@ -399,22 +440,21 @@ async fn handle_connect(
             return build_error_response(StatusCode::BAD_GATEWAY, format!("DNS 失败: {e}"));
         }
     };
-    // 第二层校验：解析结果不能落入私网/保留地址（防 DNS rebinding）。
-    let addrs = match ctx.security.filter_addrs(&host, addrs) {
+    // 第二层校验：解析结果中任一地址受限即拒绝（防 DNS rebinding）。之后只连接
+    // 这里校验过的地址，不再做第二次解析。
+    let addrs = match ctx.security.check_resolved(&host, addrs) {
         Ok(v) => v,
         Err(e) => {
-            ctx.metrics
-                .security_blocked_total
-                .with_label_values(&[e.reason()])
-                .inc();
-            ctx.metrics
-                .requests_failure
-                .with_label_values(&["blocked"])
-                .inc();
-            ctx.metrics
-                .observe_by_host(&host_port, "error", started.elapsed().as_secs_f64());
-            warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "CONNECT 目标解析到受限地址");
-            return build_error_response(StatusCode::FORBIDDEN, format!("目标被拒绝: {e}"));
+            let trace_id = header_trace_id(req.headers());
+            return reject_connect(
+                &ctx,
+                peer,
+                &host_port,
+                started,
+                &e,
+                trace_id,
+                "CONNECT 目标解析到受限地址",
+            );
         }
     };
     let target = addrs[0];
@@ -464,8 +504,7 @@ async fn handle_connect(
     let io_timeout = ctx.io_timeout;
     // CONNECT 隧道下请求体端到端加密，代理不可见；trace_id 只能来自
     // 客户端显式设置的 X-PROXY-TRACE-ID 头，否则退化为 UUID。
-    let trace_id =
-        trace_id_from_headers(req.headers()).unwrap_or_else(|| Uuid::new_v4().to_string());
+    let trace_id = header_trace_id(req.headers());
     let log_host = host_port.clone();
 
     // 这里 spawn 一个 task 在 200 响应发送之后接管 upgrade。
@@ -550,35 +589,95 @@ where
     (up_bytes, down_bytes)
 }
 
-/// 提取 `host:port`。优先用 URI authority，其次用 Host 头。
+/// CONNECT 被安全策略拒绝：计数、告警并返回 403。
+fn reject_connect(
+    ctx: &ProxyContext,
+    peer: SocketAddr,
+    host_port: &str,
+    started: Instant,
+    e: &SecurityError,
+    trace_id: String,
+    msg: &'static str,
+) -> Response<Full<Bytes>> {
+    record_security_block(ctx, peer, Some(host_port), e, trace_id);
+    ctx.metrics
+        .requests_failure
+        .with_label_values(&["blocked"])
+        .inc();
+    ctx.metrics
+        .observe_by_host(host_port, "error", started.elapsed().as_secs_f64());
+    warn!(client = %peer, host = %host_port, reason = e.reason(), error = %e, "{msg}");
+    build_error_response(StatusCode::FORBIDDEN, e.client_message())
+}
+
+/// 记录一次安全策略拦截：`proxy_security_blocked_total{reason}` 计数，并发出
+/// `proxy.blocked` 访问日志事件，便于在 OpenObserve 中按 client / reason 追查
+/// SSRF 尝试。日志保留完整原因（含解析出的地址），客户端只拿到原因标签。
+fn record_security_block(
+    ctx: &ProxyContext,
+    peer: SocketAddr,
+    host_port: Option<&str>,
+    e: &SecurityError,
+    trace_id: String,
+) {
+    ctx.metrics
+        .security_blocked_total
+        .with_label_values(&[e.reason()])
+        .inc();
+    ctx.log.emit(LogEntry {
+        timestamp: now_rfc3339(),
+        trace_id,
+        level: "WARN",
+        event: "proxy.blocked",
+        fields: serde_json::json!({
+            "client": peer.to_string(),
+            "host": host_port.unwrap_or("unknown"),
+            "reason": e.reason(),
+            "error": e.to_string(),
+        }),
+    });
+}
+
+/// 提取 `host:port`，并完成请求形态层面的安全校验。
+///
+/// - 绝对 URI 只接受 `http`（见 [`security::check_forward_scheme`]）；
+/// - 拒绝带 userinfo 的 authority 与 Host 头（RFC 9110 §4.2.4）；
+/// - 绝对 URI 优先，忽略 Host 头（RFC 9112 §3.2.2）；origin-form 才从 Host 头
+///   取目标，且出现多个 Host 头时直接拒绝（RFC 9112 §3.2），避免不同组件
+///   读出不同目标。
 ///
 /// Host 头通过 [`Authority`] 解析，避免手写 `rsplit_once(':')` 在 IPv6
 /// 字面量（`[::1]:8080`）上解析错误。
-fn extract_host_port(req: &Request<Incoming>) -> Result<(String, u16), ForwardError> {
-    if let Some(authority) = req.uri().authority() {
-        let host = authority.host().to_string();
-        let port = authority
-            .port_u16()
-            .unwrap_or_else(|| default_port(req.uri()));
-        return Ok((host, port));
+fn extract_host_port(uri: &Uri, headers: &HeaderMap) -> Result<(String, u16), ForwardError> {
+    security::check_forward_scheme(uri.scheme_str()).map_err(ForwardError::Blocked)?;
+
+    if let Some(authority) = uri.authority() {
+        security::check_no_userinfo(authority.as_str()).map_err(ForwardError::Blocked)?;
+        return Ok((
+            authority.host().to_string(),
+            authority.port_u16().unwrap_or(80),
+        ));
     }
-    if let Some(host_header) = req
-        .headers()
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-    {
-        if let Ok(authority) = host_header.parse::<Authority>() {
-            return Ok((
-                authority.host().to_string(),
-                authority
-                    .port_u16()
-                    .unwrap_or_else(|| default_port(req.uri())),
-            ));
+
+    let mut values = headers.get_all(header::HOST).iter();
+    let host_header = match (values.next(), values.next()) {
+        (None, _) => return Err(ForwardError::MissingHost),
+        (Some(_), Some(_)) => {
+            return Err(ForwardError::Blocked(SecurityError::InvalidHost(
+                "重复的 Host 头".to_string(),
+            )))
         }
-        // 解析失败时先把原始值交给安全策略的格式校验，统一返回 403。
-        return Ok((host_header.to_string(), default_port(req.uri())));
+        (Some(v), None) => v.to_str().map_err(|_| ForwardError::MissingHost)?,
+    };
+    security::check_no_userinfo(host_header).map_err(ForwardError::Blocked)?;
+    if let Ok(authority) = host_header.parse::<Authority>() {
+        return Ok((
+            authority.host().to_string(),
+            authority.port_u16().unwrap_or(80),
+        ));
     }
-    Err(ForwardError::MissingHost)
+    // 解析失败时先把原始值交给安全策略的格式校验，统一返回 403。
+    Ok((host_header.to_string(), 80))
 }
 
 /// 格式化 `host:port`，IPv6 自动加方括号（用于日志 / metrics）。
@@ -600,14 +699,6 @@ fn format_uri_authority(host: &str, port: u16) -> String {
         }
     } else {
         format_authority(host, port)
-    }
-}
-
-/// HTTP 默认端口推断。
-fn default_port(uri: &Uri) -> u16 {
-    match uri.scheme_str() {
-        Some("https") => 443,
-        _ => 80,
     }
 }
 
@@ -686,6 +777,11 @@ fn trace_id_from_headers(headers: &hyper::HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 只看请求头的 trace_id：`X-PROXY-TRACE-ID`，缺失时退化为 UUID。
+fn header_trace_id(headers: &HeaderMap) -> String {
+    trace_id_from_headers(headers).unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
 /// 试图按优先级生成 trace_id：
 ///
 /// 1. 请求头 `X-PROXY-TRACE-ID`（客户端显式指定）
@@ -728,4 +824,112 @@ fn build_error_response<S: Into<String>>(status: StatusCode, msg: S) -> Response
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Full::new(Bytes::from(msg.into())))
         .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn uri(s: &str) -> Uri {
+        s.parse().unwrap()
+    }
+
+    fn hosts(values: &[&str]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for v in values {
+            h.append(header::HOST, v.parse().unwrap());
+        }
+        h
+    }
+
+    fn blocked_reason(r: Result<(String, u16), ForwardError>) -> Option<&'static str> {
+        match r {
+            Err(ForwardError::Blocked(e)) => Some(e.reason()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn extracts_target_from_absolute_uri() {
+        let none = HeaderMap::new();
+        assert_eq!(
+            extract_host_port(&uri("http://example.com/a?b"), &none).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+        assert_eq!(
+            extract_host_port(&uri("HTTP://example.com:8080/"), &none).unwrap(),
+            ("example.com".to_string(), 8080)
+        );
+        // 绝对 URI 优先，Host 头被忽略（RFC 9112 §3.2.2）。
+        assert_eq!(
+            extract_host_port(&uri("http://example.com/"), &hosts(&["10.0.0.1"])).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_schemes() {
+        let none = HeaderMap::new();
+        for s in [
+            "https://example.com/",
+            "ftp://example.com/",
+            "gopher://example.com:70/_x",
+            "file://example.com/etc/passwd",
+        ] {
+            assert_eq!(
+                blocked_reason(extract_host_port(&uri(s), &none)),
+                Some("scheme"),
+                "{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_userinfo() {
+        let none = HeaderMap::new();
+        for s in [
+            "http://user:pass@example.com/",
+            "http://example.com@127.0.0.1/",
+        ] {
+            assert_eq!(
+                blocked_reason(extract_host_port(&uri(s), &none)),
+                Some("userinfo"),
+                "{s}"
+            );
+        }
+        assert_eq!(
+            blocked_reason(extract_host_port(
+                &uri("/"),
+                &hosts(&["example.com@10.0.0.1"])
+            )),
+            Some("userinfo")
+        );
+    }
+
+    #[test]
+    fn origin_form_requires_single_host_header() {
+        assert_eq!(
+            extract_host_port(&uri("/path"), &hosts(&["Example.com:8080"])).unwrap(),
+            ("Example.com".to_string(), 8080)
+        );
+        assert_eq!(
+            blocked_reason(extract_host_port(
+                &uri("/"),
+                &hosts(&["a.example.com", "b.example.com"])
+            )),
+            Some("invalid_host")
+        );
+        assert!(matches!(
+            extract_host_port(&uri("/"), &HeaderMap::new()),
+            Err(ForwardError::MissingHost)
+        ));
+    }
+
+    #[test]
+    fn blocked_response_does_not_echo_resolved_address() {
+        let e = ForwardError::Blocked(SecurityError::PrivateAddress("10.1.2.3".parse().unwrap()));
+        assert_eq!(e.status(), StatusCode::FORBIDDEN);
+        assert!(!e.to_string().contains("10.1.2.3"));
+        assert!(e.to_string().contains("private_ip"));
+    }
 }
