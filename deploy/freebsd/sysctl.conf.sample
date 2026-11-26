@@ -20,3 +20,11 @@ net.inet.ip.portrange.last=65535
 net.inet.tcp.keepidle=300000
 net.inet.tcp.keepintvl=30000
 net.inet.tcp.keepcnt=3
+
+# ── 小内存机器（如 2 核 512 MB） ──────────────────────────────────────────
+# 默认每个 socket 的收发缓冲可自动增长到 2 MB（sendbuf_max / recvbuf_max），
+# 几十条大流量连接就能占用数百 MB 内核内存。小内存机器取消下面两行注释，
+# 封顶到 256 KB：对 API 类小请求没有影响，单连接大文件在高延迟链路上的吞吐
+# 会受限（约 256 KB / RTT）。
+#net.inet.tcp.sendbuf_max=262144
+#net.inet.tcp.recvbuf_max=262144

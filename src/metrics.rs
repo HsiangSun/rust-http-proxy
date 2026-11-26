@@ -7,21 +7,18 @@
 //!    占位计数器，便于未来扩展 SOCKS5 支持时无需改 dashboard。
 //! 3. **进程资源指标**：CPU 使用率与常驻内存，由后台采样任务定期写入。
 //!
-//! 所有指标均通过全局 `Registry` 暴露，`render()` 输出 Prometheus 文本。
+//! 每个 [`Metrics`] 实例持有自己的 `Registry`（进程内只创建一个；测试中可以
+//! 创建多个而不会重复注册），`render()` 输出 Prometheus 文本。
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashSet;
-use once_cell::sync::Lazy;
 use prometheus::{
     Encoder, Histogram, HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts,
     Registry, TextEncoder,
 };
 use sysinfo::{Pid, ProcessRefreshKind, System};
-
-/// 全局 Prometheus Registry 单例。
-pub static REGISTRY: Lazy<Registry> = Lazy::new(Registry::new);
 
 /// 集中持有所有指标句柄，便于在请求处理路径中以 `Arc<Metrics>` 形式共享。
 #[derive(Clone)]
@@ -74,6 +71,10 @@ pub struct Metrics {
     pub security_blocked_total: IntCounterVec,
     /// host 维度指标标签溢出次数（新 host 被折叠为 `other`）。
     pub host_label_overflow_total: IntCounter,
+    /// 因达到 `server.max_connections` 而暂停 accept 的次数。
+    pub connections_throttled_total: IntCounter,
+    /// 本实例的指标注册表。
+    registry: Registry,
     /// 已登记的 host 标签集合，用于限制 Prometheus 基数。
     host_labels: DashSet<String>,
     /// host 标签数量上限。
@@ -81,7 +82,7 @@ pub struct Metrics {
 }
 
 impl Metrics {
-    /// 构造并向全局 Registry 注册所有指标。
+    /// 构造并注册所有指标。
     ///
     /// `max_host_labels` 限制按 host 分维的直方图基数，防止随机域名造成
     /// Prometheus label series 无界增长。
@@ -146,9 +147,13 @@ impl Metrics {
             "proxy_metrics_host_label_overflow_total",
             "按 host 维度指标标签溢出次数",
         )?;
+        let connections_throttled_total = IntCounter::new(
+            "proxy_connections_throttled_total",
+            "达到并发连接上限而暂停 accept 的次数",
+        )?;
 
-        // 统一注册到全局 Registry。
-        let r = &*REGISTRY;
+        let registry = Registry::new();
+        let r = &registry;
         r.register(Box::new(requests_total.clone()))?;
         r.register(Box::new(requests_success.clone()))?;
         r.register(Box::new(requests_failure.clone()))?;
@@ -169,6 +174,7 @@ impl Metrics {
         r.register(Box::new(dns_cache_entries.clone()))?;
         r.register(Box::new(security_blocked_total.clone()))?;
         r.register(Box::new(host_label_overflow_total.clone()))?;
+        r.register(Box::new(connections_throttled_total.clone()))?;
 
         Ok(Self {
             requests_total,
@@ -191,6 +197,8 @@ impl Metrics {
             dns_cache_entries,
             security_blocked_total,
             host_label_overflow_total,
+            connections_throttled_total,
+            registry,
             host_labels: DashSet::new(),
             max_host_labels: max_host_labels.max(1),
         })
@@ -224,10 +232,10 @@ impl Metrics {
         host
     }
 
-    /// 将当前 Registry 中的所有指标渲染成 Prometheus 文本格式。
+    /// 将本实例注册的所有指标渲染成 Prometheus 文本格式。
     pub fn render(&self) -> Vec<u8> {
         let encoder = TextEncoder::new();
-        let metric_families = REGISTRY.gather();
+        let metric_families = self.registry.gather();
         let mut buffer = Vec::with_capacity(4096);
         // encode 实现内部仅写入 Vec，理论上不会失败，但仍做容错处理。
         let _ = encoder.encode(&metric_families, &mut buffer);

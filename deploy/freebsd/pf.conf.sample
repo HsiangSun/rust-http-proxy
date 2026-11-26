@@ -11,6 +11,14 @@ block in log quick inet proto tcp from ! $vpc_net to any port $proxy_ports
 # 当前允许网段仅为 IPv4，拒绝这些端口的 IPv6 入站访问。
 block in log quick inet6 proto tcp from any to any port $proxy_ports
 
+# 可选：网络层禁止代理进程访问云元数据（OWASP SSRF 纵深防御）。
+# 即使应用层校验被绕过，PF 也会丢弃 rust-proxy 用户发往元数据端点的连接；
+# 只作用于代理进程，不影响 root 等其他用户（例如开机脚本）访问 IMDS。
+# pfctl 加载时会解析用户名：确认 rust-proxy 用户已存在（deploy/freebsd/install.sh
+# 会创建）后再取消下面两行的注释，并先用 pfctl -nf 校验。
+#metadata_hosts = "{ 169.254.169.254, 169.254.170.2, 169.254.170.23, fd00:ec2::254, fd00:ec2::23 }"
+#block out log quick proto { tcp, udp } from any to $metadata_hosts user "rust-proxy"
+
 # 本规则集只限制上述服务端口；其他流量（包括 SSH/DNS/DHCP）继续放行。
 pass all
 

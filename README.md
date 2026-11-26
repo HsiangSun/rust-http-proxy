@@ -11,6 +11,7 @@
 - 📉 有界 metrics 基数：随机域名不会造成 Prometheus label series 无界增长
 - 🐧🐡 支持 Linux 与 FreeBSD
 - 🧵 纯 safe Rust，全链路超时与有界反压
+- 📦 内存有界：请求/响应体流式转发、连接缓冲封顶、空闲与慢速连接自动回收，2 核 512 MB 的小机器也能稳定运行
 
 ## 快速开始
 
@@ -93,20 +94,41 @@ sudo systemctl stop rust-http-proxy
 
 ## 安全加固
 
-`config.toml` 的 `[security]` 段控制目标地址策略，默认配置已经开启基础防护：
+目标地址策略参考 [OWASP SSRF Prevention Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html)，
+由 `config.toml` 的 `[security]` 段控制，默认配置即开启全部防护：
 
 ```toml
 [security]
-block_private_ips = true          # 拒绝 127.0.0.1 / 10.x / 169.254.169.254 / ULA 等
+block_private_ips = true          # 拒绝私网/回环/CGNAT/保留等非全球可路由地址
 block_ip_literals = false         # 是否连公网 IP 字面量也拒绝
+block_internal_domains = true     # 拒绝 localhost/metadata 等单标签名与 .internal/.local 等内部后缀
 allowed_ports = [80, 443]         # 目标端口白名单，空数组表示不限制
 domain_allowlist = []             # 非空时只放行匹配域名，支持 *.example.com
 domain_blocklist = []             # 统一拦截已知恶意/钓鱼域名，支持 *.example.com
+blocked_cidrs = []                # 额外拒绝网段，例如按来源 IP 信任本代理出口的公网服务
 ```
 
-- 校验同时覆盖普通 HTTP 与 HTTPS CONNECT。
-- DNS 解析完成后会再次过滤地址，防止 DNS rebinding 把公网域名切换为内网 IP。
+| 防护 | 行为 |
+|------|------|
+| 云元数据 | `169.254.0.0/16`、`fe80::/10`、`fd00:ec2::/32` 等 IMDS 地址**始终拒绝**，关闭 `block_private_ips` 也不例外 |
+| 地址规范化 | `::ffff:169.254.169.254`、NAT64 `64:ff9b::a9fe:a9fe` 先还原为内嵌 IPv4 再判断；IPv6 只放行 `2000::/3` 全球单播 |
+| IP 编码绕过 | `0x7f.1`、`2130706433`、`0177.0.0.1`、`127.1` 等会被 getaddrinfo 当作 IP 的写法直接拒绝 |
+| DNS rebinding | 解析结果中任一地址受限即拒绝整个目标；只连接校验过的地址，连接池建连前对实际使用的地址再校验 |
+| 请求形态 | 普通转发只接受 `http://`（HTTPS 走 CONNECT）；拒绝 `user@host` 形式的 userinfo 与重复 Host 头 |
+| 内部域名 | 拒绝单标签主机名（会被 resolv.conf 的 search 域补全）与 `.internal`/`.local`/`.localhost`/`.home.arpa` 等后缀 |
+| 信息泄露 | 403 只返回 `reason=<标签>`，不回显解析出的内网地址；完整原因写入服务端日志 |
+| 配置校验 | 写错的网段/域名规则会导致启动失败，不会被静默忽略 |
+
+- 校验同时覆盖普通 HTTP 与 HTTPS CONNECT；代理不跟随上游重定向（3xx 原样返回，客户端的下一跳请求会重新校验）。
+- 每次拦截计入 `proxy_security_blocked_total{reason}`，并发出 `proxy.blocked` 访问日志事件（含 client、host、完整原因），可在 OpenObserve 中按来源追查。
 - `[metrics] max_host_labels` 限制 host 维度指标基数；随机域名/不存在的域名会被折叠为 `other`。
+
+网络层纵深防御（OWASP 建议应用层与网络层同时设防）：
+
+- systemd unit 通过 `IPAddressDeny=` 在内核层丢弃本服务与 IMDS / ECS / EKS Pod Identity 元数据端点之间的报文。
+- FreeBSD 可启用 `deploy/freebsd/pf.conf.sample` 中注释掉的 `user "rust-proxy"` 出站规则。
+- EC2 建议开启 IMDSv2（`HttpTokens=required`）并把 `HttpPutResponseHopLimit` 设为 1。注意正向代理可以替客户端发送
+  PUT 与任意请求头，IMDSv2 本身挡不住经代理发起的请求，应用层与网络层拦截才是关键。
 
 ## FreeBSD
 
@@ -140,6 +162,46 @@ tail -F /var/log/rust-http-proxy.log
 内核调优参考 `deploy/freebsd/sysctl.conf.sample`（默认不自动修改系统配置）。
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
 `rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
+
+### 小内存机器调优（如 2 核 512 MB）
+
+响应体始终流式转发，超过 `max_buffered_body_bytes` 的请求体也流式上传，单个请求的内存
+占用与 body 大小无关（Linux 实测：经代理下载 200 MiB 时进程峰值 6.3 MiB，4 路 50 MiB
+并发下载 6.7 MiB，空闲 5.7 MiB）。小内存机器主要按并发量控制总量，在
+`/usr/local/rust-http-proxy/config.toml` 中调整（安装脚本不会覆盖已有配置），改完
+`service rust-http-proxy restart`：
+
+```toml
+[server]
+max_connections = 1024            # 并发连接上限，满了之后新连接在内核 backlog 排队
+client_idle_timeout_secs = 120    # 回收空闲 keep-alive 连接与慢速连接；要长于客户端连接池空闲超时（Go 默认 90s）
+max_buffered_body_bytes = 262144  # 只有不超过 256 KiB 的请求体才整体缓冲
+
+[dns]
+max_concurrent_lookups = 16       # 同时进行的 getaddrinfo（阻塞线程）上限
+
+[upstream]
+pool_max_idle_per_host = 16       # 每个上游最多保留的空闲 keep-alive 连接
+
+[metrics]
+max_host_labels = 256
+
+[openobserve]
+channel_capacity = 2000           # OpenObserve 不可达时最多积压的日志条数
+```
+
+- 每条空闲客户端连接约 20 KiB（实测 2000 条慢速连接增加约 37 MiB）；正在传输的连接
+  另有双向各不超过 64 KiB 的缓冲，再加内核 socket 缓冲。
+- 观察 `proxy_active_connections` 与 `process_memory_bytes` 后再调整 `max_connections`；
+  `proxy_connections_throttled_total` 持续增长说明上限偏小。
+- 内核侧：FreeBSD 默认允许每个 socket 的收发缓冲自动增长到 2 MiB，大流量连接一多就会
+  占用大量内核内存。`deploy/freebsd/sysctl.conf.sample` 的「小内存机器」一节给出了
+  封顶到 256 KiB 的设置。
+- 内存分配器：Linux 的 systemd unit 默认设置 `MALLOC_ARENA_MAX=2`，限制 glibc 的 arena 数，
+  常驻内存约减半（24 核压测后 31 → 15 MiB）；代价是每秒十几万请求的 keep-alive 压测下吞吐降
+  10%~20%。FreeBSD 用 jemalloc，空闲内存会自动归还，不需要这项设置。
+- `max_host_labels` 决定按 host 指标的上限：实测每个 host 产生 6 种结果时，1024 个 host 约占
+  30 MiB、`/metrics` 约 8 MiB；256 个 host 约 10 MiB、2 MiB。真实上游不多时用 256 即可。
 
 FreeBSD 安装脚本会自动配置独立日志、日志轮转和定时检查，并通过 `NO_COLOR=1`
 禁用颜色控制码、通过 syslogd 的 `-8` 参数保留中文 UTF-8 字节。

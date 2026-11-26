@@ -27,6 +27,15 @@ ExecStart=/opt/rust-http-proxy/rust-http-proxy
 # ── 日志：走 systemd-journald ─────────────────────────────────────────────
 # RUST_LOG 控制 tracing 级别；info 满足大多数场景。
 Environment=RUST_LOG=info
+
+# ── 内存分配器（glibc） ────────────────────────────────────────────────────
+# glibc malloc 默认最多建 8×核数 个 arena，各 arena 释放的内存留在进程里不还给系统，
+# 线程多时常驻内存明显偏高。限制为 2 个 arena 的实测效果：
+#   - 1024 个 host 指标标签时常驻内存 54 MiB → 36 MiB；24 核压测后 31 MiB → 15 MiB；
+#   - 24 核、每秒 15 万请求的 keep-alive 压测吞吐下降 10%~20%，每请求新建连接时无明显差别。
+# 业务量远低于该水平时吞吐影响可以忽略；核数多且吞吐极高的机器可调大或删掉这一行。
+# 只对 glibc 生效（发布的 Linux 二进制为 *-linux-gnu）；FreeBSD 用 jemalloc，不需要。
+Environment=MALLOC_ARENA_MAX=2
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=rust-http-proxy
@@ -59,6 +68,13 @@ RestrictSUIDSGID=true
 LockPersonality=true
 # 只允许 IPv4/IPv6 + AF_UNIX；屏蔽其他协议族减少内核攻击面。
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# 网络层 SSRF 纵深防御（OWASP：应用层与网络层同时设防）：即使应用层目标校验被
+# 绕过，内核（cgroup BPF）也会丢弃本服务与云元数据端点之间的报文——
+# AWS/GCP/Azure/OCI IMDS 169.254.169.254、ECS 任务元数据 169.254.170.2、
+# EKS Pod Identity 169.254.170.23 及对应 IPv6。只列具体地址而不是整个
+# 169.254.0.0/16，避免误伤经 169.254.169.253 访问的 Amazon DNS。
+# 内核不支持 BPF 防火墙时 systemd 只打印告警，服务照常启动。
+IPAddressDeny=169.254.169.254 169.254.170.2 169.254.170.23 fd00:ec2::254 fd00:ec2::23
 # 屏蔽访问 /sys/fs/cgroup 之类的旁路。
 ProtectClock=true
 ProtectHostname=true

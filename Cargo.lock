@@ -1056,7 +1056,6 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
- "once_cell",
  "prometheus",
  "reqwest",
  "serde",
