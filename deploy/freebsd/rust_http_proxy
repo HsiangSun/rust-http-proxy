@@ -54,6 +54,8 @@ start_precmd="rust_http_proxy_prestart"
 # -f 关闭继承的标准输入输出，避免占用启动服务的 SSH 会话。
 # -u 仅降权一次；-S -T 将输出写入 syslog。
 # 在 daemon 设置用户环境后传入配置路径与日志级别，避免依赖 cwd。
+# 不需要 Linux 部署里的 MALLOC_ARENA_MAX：它只对 glibc 生效，FreeBSD libc 用的是
+# jemalloc，空闲内存默认约 10 秒后归还系统。
 command_args="-f -p \"${pidfile}\" -u \"${_rust_http_proxy_user}\" -S -T rust-http-proxy \
     /usr/bin/env \
     PROXY_CONFIG=\"${rust_http_proxy_config}\" \

@@ -100,6 +100,8 @@
   与 `upstream.pool_idle_timeout_secs`。高并发请求同一目标时，仅在池满或
   连接被对端关闭时才会触发新建连接，**显著减少本机出向端口消耗**
   （否则极易在 `2k+ QPS / 同一目标`场景触发 `EADDRNOTAVAIL`）。
+- 设置 `pool_timer` 后空闲连接由后台任务按 `pool_idle_timeout_secs` 主动回收；
+  不设置时 hyper-util 只在复用时检查过期，长期不再访问的上游连接会一直占着内存与 fd。
 - 对 HTTPS CONNECT：隧道天然 1:1，无法跨用户复用；每次现连。
 
 ### 3.4 DNS 缓存
@@ -109,6 +111,11 @@
 - TTL 60s（可配置）；惰性过期 + 软容量上限（优先清过期，其次随机驱逐）。
 - 命中/未命中分别打点到 `proxy_dns_cache_hits_total` /
   `proxy_dns_cache_misses_total`；当前条目数暴露为 `proxy_dns_cache_entries`。
+- **singleflight**：同一域名并发未命中时只发起一次 getaddrinfo，其余请求等待同一结果；
+  缓存过期瞬间的并发请求不会各自占用一个阻塞线程。
+- **解析并发上限**：同时进行的 getaddrinfo 不超过 `dns.max_concurrent_lookups`，名额在
+  getaddrinfo 真正返回时才释放（它无法取消），tokio 阻塞线程池按同一数值封顶。DNS 故障时
+  新的解析在异步等待名额阶段超时，不会在阻塞线程池队列中堆积。
 
 ### 3.5 Metrics
 - 全量使用 `prometheus` crate；统一通过 `Registry::gather` 输出
@@ -128,21 +135,29 @@
 - **OpenObserve 未启用时降级到 console**：`LogSink::console()` 把每条
   访问日志走 `tracing::info!("access", trace_id=..., event=..., fields=...)`,
   受 `RUST_LOG` 控制。本地开发或外发未配置时也能立刻看到访问日志。
+- **访问日志在响应体传完时上报**：`proxy.request` 的 `bytes_down` 为实际转发字节；
+  响应体没有完整送达（上游出错、空闲超时、客户端提前断开）时 level 为 WARN 并带 `error` 字段。
+- **失败与客户端放弃的请求同样有访问日志**：返回错误响应时上报 level=WARN 的
+  `proxy.request` / `proxy.connect`（含 `status`、`reason`、`error`、`duration_ms`）。客户端在
+  代理给出响应前断开时，hyper 直接丢弃请求处理的 future，由 `PendingRequest` 的 Drop 补记
+  `reason=client_closed`；进程退出时被运行时丢弃的请求不计。
 - **上游失败的根因可观察**：CONNECT/HTTP 转发路径在 DNS 解析、TCP 建连、
   上游请求三个失败点都会以 `warn!` 输出 `client=peer host=h:p kind=ErrorKind error=msg`,
   让 `EADDRNOTAVAIL`（本机端口耗尽）、`ECONNREFUSED`（远端拒绝）、`timeout`
   这种问题可以从日志直接定位，无需翻指标。
 
 ### 3.7 trace_id 提取
-- HTTP 转发场景：收齐请求体后调用 `extract_trace_id(body)`，尝试
-  `serde_json::from_slice` 解析；若得到顶层字段 `dis_order_no`（非空
-  字符串），即用之，否则退化为 `Uuid::new_v4()`。
+- HTTP 转发场景：请求体不超过 `server.max_buffered_body_bytes`（默认 256 KiB）时整体缓冲，
+  用只含 `dis_order_no` 一个字段的结构体反序列化（其余字段跳过，不构建 JSON 树），取顶层的
+  非空字符串；更大的请求体流式转发，trace_id 取 `X-PROXY-TRACE-ID` 请求头，否则退化为
+  `Uuid::new_v4()`。
 - CONNECT 场景：请求体不可读（端到端 TLS），直接生成 UUID v4。
 
 ### 3.8 安全性与正确性
 - 全部 `safe Rust`，无 `unsafe`。
 - hop-by-hop 头部统一剥除（RFC 7230 §6.1）。
-- 所有上游 IO 均有显式超时（建连、send_request、tunnel 读写）。
+- 所有 IO 均有显式超时：建连超时；上游 IO 空闲超时（请求体上传、等待响应头、
+  响应体下载、隧道读写，持续有数据流动就不会触发）；客户端请求头超时（含 keep-alive 空闲）。
 - mpsc 通道有界，`try_send` 失败即丢弃，杜绝日志背压拖垮主路径。
 - 错误以 `thiserror` 枚举分类后映射到 metrics 标签与 HTTP 状态码。
 
@@ -183,6 +198,38 @@
 - 被拦截目标通过 `proxy_security_blocked_total{reason}` 观测。
 
 ---
+
+### 3.10 内存与连接资源
+目标是让单个请求的内存与 body 大小无关、总内存只随并发连接数线性增长，以便在 2 核
+512 MB 的机器上稳定运行（推荐配置见 README「小内存机器调优」）。
+
+| 资源 | 控制方式 |
+|------|---------|
+| 响应体 | 流式转发（`body::ResponseBody`），每帧累加 `proxy_bytes_down_total`；等待上游数据超过 `io_timeout_secs` 即中断 |
+| 请求体 | 不超过 `max_buffered_body_bytes` 时整体缓冲（提取 `dis_order_no`），超过则"已读前缀 + 剩余部分"流式上传（`body::buffer_or_stream`） |
+| 单连接缓冲 | 客户端侧与上游侧的 hyper 读写缓冲上限均为 64 KiB（默认约 400 KiB），同时也是请求头 / 响应头的大小上限 |
+| 空闲 / 慢速客户端 | hyper 设置 timer 后 `header_read_timeout`（= `client_idle_timeout_secs`）生效，覆盖 keep-alive 空闲期与 slowloris |
+| 并发连接 | `max_connections`：达到上限后暂停 accept，新连接在内核 backlog 排队；计数见 `proxy_connections_throttled_total` |
+| 阻塞线程 | `dns.max_concurrent_lookups` 同时限制 getaddrinfo 并发与阻塞线程池大小，并配合 singleflight |
+| 上游空闲连接 | `pool_timer` 主动回收，`pool_max_idle_per_host` 限制每个上游的空闲连接数 |
+| 其他有界结构 | DNS 缓存 `max_entries`、host 指标标签 `max_host_labels`、日志通道 `channel_capacity` |
+
+超时按"空闲"而非"总时长"计算（`body::Activity` / `body::idle_timeout`）：只要请求体还在
+上传或响应体还在下载就不会被中断；请求体传完后，"空闲"就是等待上游响应头的时间。
+响应体的空闲计时只在等待上游数据时进行，客户端读得慢（背压）不算上游空闲。
+
+Linux 实测（release 构建，绑定 2 核）：
+
+| 场景 | 改动前峰值 RSS | 改动后峰值 RSS |
+|------|---------------|---------------|
+| 经代理下载 200 MiB | 208 MiB | 6.3 MiB |
+| 4 路 50 MiB 并发下载 | 224.5 MiB | 6.7 MiB |
+| 上传 100 MiB | 233.9 MiB | 6.9 MiB |
+| 300 个并发 DNS 未命中 | 约 300 个线程 | 70 个线程（64 + 基础线程）|
+| 2000 条 slowloris 连接（35 s 后） | 全部仍在 | 全部被回收 |
+
+`tests/resource_e2e.rs` 以端到端测试固定了上述行为（大文件上传 / 下载峰值内存上限、
+空闲与慢速连接回收、并发连接上限）。
 
 ## 4. 启动与配置
 

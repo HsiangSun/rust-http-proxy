@@ -1,8 +1,8 @@
 //! rust-http-proxy 主入口。
 //!
 //! 流程：
-//! 1. 解析配置（`config.toml` + 环境变量覆盖）。
-//! 2. 初始化 tracing 日志输出。
+//! 1. 初始化 tracing 日志输出，解析配置（`config.toml` + 环境变量覆盖）。
+//! 2. 按配置构建 tokio runtime（限制阻塞线程池大小）。
 //! 3. 构造 metrics / DNS 缓存 / 日志 sink 等共享组件。
 //! 4. 启动 `/metrics` HTTP 服务。
 //! 5. 按 worker 数启动 N 个绑定相同端口（SO_REUSEPORT）的 accept 循环。
@@ -13,9 +13,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod body;
 mod config;
 mod dns;
 mod listener;
@@ -25,8 +27,7 @@ mod metrics_server;
 mod proxy;
 mod security;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // 默认日志级别 info，可通过 RUST_LOG 环境变量覆盖。
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -40,6 +41,19 @@ async fn main() -> anyhow::Result<()> {
     let cfg = config::Config::load(&cfg_path)?;
     info!(config = %cfg_path, "配置加载完成");
 
+    // worker 线程数沿用默认（CPU 核数）。阻塞线程池基本只用于 getaddrinfo：
+    // tokio 默认上限 512，DNS 变慢或大量未命中时每个解析占一个线程且超时后无法
+    // 取消，线程数会暴涨。DnsCache 已把同时进行的解析限制在
+    // dns.max_concurrent_lookups 个，这里按同一数值封顶（另留 2 个给日志上报
+    // 客户端等其他阻塞任务）。
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(cfg.dns.max_concurrent_lookups.max(1) + 2)
+        .build()?;
+    runtime.block_on(run(cfg))
+}
+
+async fn run(cfg: config::Config) -> anyhow::Result<()> {
     // 构造共享组件。
     let metrics = Arc::new(metrics::Metrics::new(cfg.metrics.max_host_labels)?);
     metrics::spawn_process_sampler(metrics.clone());
@@ -48,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cfg.dns.ttl_secs),
         cfg.dns.max_entries,
         Duration::from_secs(cfg.dns.timeout_secs),
+        cfg.dns.max_concurrent_lookups,
         metrics.clone(),
     ));
     // 安全规则写错时直接退出，避免以为已拦截的目标实际仍可访问。
@@ -83,13 +98,20 @@ async fn main() -> anyhow::Result<()> {
         upstream: cfg.upstream.clone(),
         security,
         io_timeout: Duration::from_secs(cfg.server.io_timeout_secs),
+        client_idle_timeout: (cfg.server.client_idle_timeout_secs > 0)
+            .then(|| Duration::from_secs(cfg.server.client_idle_timeout_secs)),
+        max_buffered_body: cfg.server.max_buffered_body_bytes,
         http_client,
     });
 
+    // 所有 worker 共享同一个并发连接上限。
+    let limiter = (cfg.server.max_connections > 0)
+        .then(|| Arc::new(Semaphore::new(cfg.server.max_connections)));
     for worker_id in 0..workers {
         let ctx = ctx.clone();
+        let limiter = limiter.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_accept_loop(proxy_addr, ctx).await {
+            if let Err(e) = run_accept_loop(proxy_addr, ctx, limiter).await {
                 error!(worker_id, error = %e, "accept 循环退出");
             }
         });
@@ -99,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
     // 停止 daemon；交互场景则是 SIGINT（Ctrl+C）。
     wait_for_shutdown_signal().await?;
     info!("收到退出信号，准备退出");
+    // 之后运行时会直接丢弃进行中的请求，不要把它们记成客户端断开。
+    proxy::begin_shutdown();
     Ok(())
 }
 
@@ -122,9 +146,36 @@ async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
 
 /// 单个 worker 的 accept 循环：使用 SO_REUSEPORT 监听器接受连接，
 /// 并为每个连接 spawn 一个 handler task。
-async fn run_accept_loop(addr: SocketAddr, ctx: Arc<proxy::ProxyContext>) -> anyhow::Result<()> {
+///
+/// 配置了 `limiter` 时，先拿到连接名额再 accept：达到上限后新连接留在内核
+/// backlog 中排队，而不是被 accept 进来继续占用内存。
+async fn run_accept_loop(
+    addr: SocketAddr,
+    ctx: Arc<proxy::ProxyContext>,
+    limiter: Option<Arc<Semaphore>>,
+) -> anyhow::Result<()> {
     let listener = listener::build_reuseport_listener(addr, 2048)?;
+    // 只在进入"已满"状态时告警一次，持续满载时不刷屏；次数看
+    // proxy_connections_throttled_total。
+    let mut throttled = false;
     loop {
+        let permit = match &limiter {
+            None => None,
+            Some(limiter) => Some(match limiter.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    throttled = false;
+                    permit
+                }
+                Err(_) => {
+                    ctx.metrics.connections_throttled_total.inc();
+                    if !throttled {
+                        throttled = true;
+                        warn!("并发连接数已达 server.max_connections，暂停 accept");
+                    }
+                    limiter.clone().acquire_owned().await?
+                }
+            }),
+        };
         let (stream, peer) = match listener.accept().await {
             Ok(v) => v,
             Err(e) => {
@@ -136,7 +187,8 @@ async fn run_accept_loop(addr: SocketAddr, ctx: Arc<proxy::ProxyContext>) -> any
         };
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            proxy::handle_client(stream, peer, ctx).await;
+            // 名额随连接（含其 CONNECT 隧道）结束归还。
+            proxy::handle_client(stream, peer, ctx, permit).await;
         });
     }
 }

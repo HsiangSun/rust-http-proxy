@@ -8,12 +8,13 @@
 |--------|------|------|------|
 | `proxy_requests_total` | counter | — | 收到的请求总数（HTTP + CONNECT）|
 | `proxy_requests_success_total` | counter | `protocol`={http,https} | 处理成功的请求 |
-| `proxy_requests_failure_total` | counter | `reason`={missing_host,dns,blocked,connect,handshake,upstream,body,timeout} | 失败计数 |
-| `proxy_active_connections` | gauge | — | 当前活跃客户端连接数 |
+| `proxy_requests_failure_total` | counter | `reason`={missing_host,dns,blocked,connect,handshake,upstream,body,timeout,client_closed} | 失败计数；`client_closed` 为客户端在代理返回响应前断开（多为客户端自身超时先到，如 Go `http.Client.Timeout`）|
+| `proxy_active_connections` | gauge | — | 当前活跃客户端连接数，含已建立的 CONNECT 隧道（此前隧道建立后即不再计入）|
+| `proxy_connections_throttled_total` | counter | — | 达到 `server.max_connections` 而暂停 accept 的次数；持续增长说明上限偏小 |
 | `proxy_https_tunnels_total` | counter | — | HTTPS CONNECT 隧道总数 |
 | `proxy_bytes_up_total` | counter | — | 客户端 → 上游 总字节数 |
-| `proxy_bytes_down_total` | counter | — | 上游 → 客户端 总字节数 |
-| `proxy_request_duration_seconds` | histogram | — | 请求生命周期耗时（秒，全局视图）|
+| `proxy_bytes_down_total` | counter | — | 上游 → 客户端 总字节数（随流式转发实时累加）|
+| `proxy_request_duration_seconds` | histogram | — | 请求生命周期耗时（秒，全局视图）；HTTP 转发计到响应体传完为止 |
 | `proxy_request_duration_by_host_seconds` | histogram | `host`, `status` | 按上游 host 分维的耗时；host 基数受 `[metrics] max_host_labels` 限制，超出后记为 `other`；status 取 `2xx`/`3xx`/`4xx`/`5xx`/`tunnel`/`error`/`unknown` |
 | `proxy_upstream_connect_seconds` | histogram | — | 上游 TCP 建连耗时（秒）|
 
@@ -79,4 +80,5 @@
 > 长期请求死域名，会导致此类失败 counter 持续增长，用 `rate()` 也无法完全消掉（只要还在
 > 打），因此从分母剔除。要定位具体是谁在打死域名，看 `proxy_request_duration_by_host_seconds`
 > 里 `status="error"` 的 host 分布，再结合 openobserve 日志 (`event=proxy.request` + `host=...`)
-> 反查客户端 IP。
+> 反查客户端 IP。`client_closed` 保留在分母里：它通常说明上游（或代理）慢于客户端的超时，
+> 请求对客户端而言确实失败了。

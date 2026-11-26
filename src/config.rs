@@ -38,8 +38,32 @@ pub struct ServerConfig {
     pub listen: String,
     /// 启动多少个使用 SO_REUSEPORT 共享监听端口的 worker；0 表示 CPU 核数。
     pub workers: usize,
-    /// 单条连接的整体读写超时（秒）。
+    /// 上游 IO 空闲超时（秒）：HTTP 请求体上传、等待响应头、响应体下载以及
+    /// CONNECT 隧道，只要超过该时长没有任何数据流动就中断。
     pub io_timeout_secs: u64,
+    /// 同时服务的客户端连接上限；0 表示不限制。达到上限后暂停 accept，
+    /// 新连接在内核 backlog 中排队，避免连接数暴涨把内存耗尽。
+    #[serde(default)]
+    pub max_connections: usize,
+    /// 客户端连接等待完整请求头的最长时间（秒），包含 keep-alive 两次请求之间
+    /// 的空闲期；超时即关闭连接，回收空闲连接与 slowloris 慢速连接。0 表示不限制。
+    #[serde(default = "default_client_idle_timeout")]
+    pub client_idle_timeout_secs: u64,
+    /// 普通 HTTP 请求体不超过该字节数时整体缓冲，用于从 JSON 中提取
+    /// `dis_order_no` 作为 trace_id；超过则流式转发（trace_id 退化为请求头
+    /// 或 UUID），单个请求占用的内存因此与请求体大小无关。
+    #[serde(default = "default_max_buffered_body_bytes")]
+    pub max_buffered_body_bytes: usize,
+}
+
+/// 120s：长于 Go `http.Transport` 默认的 90s `IdleConnTimeout`，让客户端先关闭
+/// 空闲连接，避免代理关闭的同一刻客户端正复用它发出请求（非幂等请求不会自动重试）。
+fn default_client_idle_timeout() -> u64 {
+    120
+}
+
+fn default_max_buffered_body_bytes() -> usize {
+    256 * 1024
 }
 
 impl Default for ServerConfig {
@@ -47,7 +71,10 @@ impl Default for ServerConfig {
         Self {
             listen: "0.0.0.0:8080".to_string(),
             workers: 0,
-            io_timeout_secs: 60,
+            io_timeout_secs: 120,
+            max_connections: 0,
+            client_idle_timeout_secs: default_client_idle_timeout(),
+            max_buffered_body_bytes: default_max_buffered_body_bytes(),
         }
     }
 }
@@ -90,10 +117,19 @@ pub struct DnsConfig {
     /// 阻塞，必须有上限，避免请求 task 与连接长期挂起。
     #[serde(default = "default_dns_timeout")]
     pub timeout_secs: u64,
+    /// 同时进行的系统 DNS 解析（getaddrinfo）上限，即 tokio 阻塞线程池上限。
+    /// getaddrinfo 占用一个阻塞线程且超时后无法取消，不设上限时 DNS 变慢或
+    /// 大量未命中会让线程数涨到数百个；超出的解析排队等待。
+    #[serde(default = "default_max_concurrent_lookups")]
+    pub max_concurrent_lookups: usize,
 }
 
 fn default_dns_timeout() -> u64 {
     5
+}
+
+fn default_max_concurrent_lookups() -> usize {
+    64
 }
 
 impl Default for DnsConfig {
@@ -102,6 +138,7 @@ impl Default for DnsConfig {
             ttl_secs: 60,
             max_entries: 10_000,
             timeout_secs: default_dns_timeout(),
+            max_concurrent_lookups: default_max_concurrent_lookups(),
         }
     }
 }

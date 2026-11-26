@@ -11,6 +11,7 @@
 - 📉 有界 metrics 基数：随机域名不会造成 Prometheus label series 无界增长
 - 🐧🐡 支持 Linux 与 FreeBSD
 - 🧵 纯 safe Rust，全链路超时与有界反压
+- 📦 内存有界：请求/响应体流式转发、连接缓冲封顶、空闲与慢速连接自动回收，2 核 512 MB 的小机器也能稳定运行
 
 ## 快速开始
 
@@ -161,6 +162,46 @@ tail -F /var/log/rust-http-proxy.log
 内核调优参考 `deploy/freebsd/sysctl.conf.sample`（默认不自动修改系统配置）。
 可通过 `PROXY_CONFIG=/path/to/config.toml` 或 rc.conf 的
 `rust_http_proxy_config` 指定配置文件（rc.conf 变量名仍使用下划线）。
+
+### 小内存机器调优（如 2 核 512 MB）
+
+响应体始终流式转发，超过 `max_buffered_body_bytes` 的请求体也流式上传，单个请求的内存
+占用与 body 大小无关（Linux 实测：经代理下载 200 MiB 时进程峰值 6.3 MiB，4 路 50 MiB
+并发下载 6.7 MiB，空闲 5.7 MiB）。小内存机器主要按并发量控制总量，在
+`/usr/local/rust-http-proxy/config.toml` 中调整（安装脚本不会覆盖已有配置），改完
+`service rust-http-proxy restart`：
+
+```toml
+[server]
+max_connections = 1024            # 并发连接上限，满了之后新连接在内核 backlog 排队
+client_idle_timeout_secs = 120    # 回收空闲 keep-alive 连接与慢速连接；要长于客户端连接池空闲超时（Go 默认 90s）
+max_buffered_body_bytes = 262144  # 只有不超过 256 KiB 的请求体才整体缓冲
+
+[dns]
+max_concurrent_lookups = 16       # 同时进行的 getaddrinfo（阻塞线程）上限
+
+[upstream]
+pool_max_idle_per_host = 16       # 每个上游最多保留的空闲 keep-alive 连接
+
+[metrics]
+max_host_labels = 256
+
+[openobserve]
+channel_capacity = 2000           # OpenObserve 不可达时最多积压的日志条数
+```
+
+- 每条空闲客户端连接约 20 KiB（实测 2000 条慢速连接增加约 37 MiB）；正在传输的连接
+  另有双向各不超过 64 KiB 的缓冲，再加内核 socket 缓冲。
+- 观察 `proxy_active_connections` 与 `process_memory_bytes` 后再调整 `max_connections`；
+  `proxy_connections_throttled_total` 持续增长说明上限偏小。
+- 内核侧：FreeBSD 默认允许每个 socket 的收发缓冲自动增长到 2 MiB，大流量连接一多就会
+  占用大量内核内存。`deploy/freebsd/sysctl.conf.sample` 的「小内存机器」一节给出了
+  封顶到 256 KiB 的设置。
+- 内存分配器：Linux 的 systemd unit 默认设置 `MALLOC_ARENA_MAX=2`，限制 glibc 的 arena 数，
+  常驻内存约减半（24 核压测后 31 → 15 MiB）；代价是每秒十几万请求的 keep-alive 压测下吞吐降
+  10%~20%。FreeBSD 用 jemalloc，空闲内存会自动归还，不需要这项设置。
+- `max_host_labels` 决定按 host 指标的上限：实测每个 host 产生 6 种结果时，1024 个 host 约占
+  30 MiB、`/metrics` 约 8 MiB；256 个 host 约 10 MiB、2 MiB。真实上游不多时用 256 即可。
 
 FreeBSD 安装脚本会自动配置独立日志、日志轮转和定时检查，并通过 `NO_COLOR=1`
 禁用颜色控制码、通过 syslogd 的 `-8` 参数保留中文 UTF-8 字节。

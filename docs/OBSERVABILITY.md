@@ -95,6 +95,12 @@ kubectl apply -f rust-http-proxy-foopay.yaml
 
 文件：[`grafana-dashboard.json`](./grafana-dashboard.json)
 
+另有 v2：[`grafana-dashboard2.json`](./grafana-dashboard2.json)。导入步骤与变量相同，uid 不同，可与原面板并存。
+在原面板基础上增加：失败原因占比（含 `client_closed`）、连接数与接入限流、HTTPS 隧道新建速率与
+隧道时长、安全拦截（按原因、`metadata_ip`）、host 标签溢出、内存参考线（按 2 核 512 MB）。图例里的失败原因与拦截
+原因显示为中文，括号里保留日志中的 reason 代码，例如 `云元数据地址（metadata_ip）`。按 host 的
+P99 改为只统计普通 HTTP 请求：原面板把隧道的存活时长也算了进去，HTTPS 目标的 P99 会被拉高。
+
 ### 导入步骤
 1. Grafana 左侧 → **Dashboards → New → Import**
 2. 上传 `grafana-dashboard.json`，或粘贴文件内容
@@ -233,7 +239,12 @@ journalctl -u rust-http-proxy -f | head -5
 
 OpenObserve UI → Logs → Stream 选 `proxy_logs` → 时间窗 last 5 min →
 应能看到代理的 `proxy.request` / `proxy.connect` 事件；被安全策略拦截的请求记为
-`proxy.blocked`（level=WARN，含 `client`、`host`、`reason`、`error`）。过滤条件加：
+`proxy.blocked`（level=WARN，含 `client`、`host`、`reason`、`error`）。`proxy.request`
+在响应体传完时上报；响应体没有完整送达（上游出错、空闲超时、客户端提前断开）时
+level=WARN 并带 `error` 字段。返回错误响应（502/504 等）的请求，以及客户端在代理返回
+响应前断开的请求（`reason=client_closed`，多为客户端自身超时先到），也各上报一条
+level=WARN 的 `proxy.request`（CONNECT 为 `proxy.connect`），含 `reason`、`error`、
+`duration_ms`，错误响应另带 `status`。过滤条件加：
 
 ```
 proxy_group='sevenpay-proxy'
